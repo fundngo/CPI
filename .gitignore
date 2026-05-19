@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.vite/
+
+# SQLite database files — never commit; exposes demo data at rest
+data.db
+data.db-shm
+data.db-wal
+data.db-journal
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Screenshots and dev artifacts
+*.png
+*.jpg
+*.jpeg
+screenshot.png
+
+# Logs and OS files
+*.log
+.DS_Store
