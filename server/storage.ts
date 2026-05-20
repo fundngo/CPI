@@ -312,6 +312,34 @@ export class DatabaseStorage implements IStorage {
   async listPublicRecords(clientId: number): Promise<PublicRecord[]> {
     return db.select().from(publicRecords).where(eq(publicRecords.clientId, clientId)).all();
   }
+
+  // Replace-all helpers — used when re-extracting from a file (refresh-from-files endpoint)
+  async replaceCards(clientId: number, items: Array<Omit<InsertCreditCard, "clientId">>): Promise<void> {
+    db.delete(creditCards).where(eq(creditCards.clientId, clientId)).run();
+    for (const it of items) {
+      db.insert(creditCards).values({ ...it, clientId } as any).run();
+    }
+  }
+  async replaceChargeOffs(clientId: number, items: Array<Omit<InsertChargeOff, "clientId">>): Promise<void> {
+    db.delete(chargeOffs).where(eq(chargeOffs.clientId, clientId)).run();
+    for (const it of items) db.insert(chargeOffs).values({ ...it, clientId } as any).run();
+  }
+  async replaceCollections(clientId: number, items: Array<Omit<InsertCollection, "clientId">>): Promise<void> {
+    db.delete(collections).where(eq(collections.clientId, clientId)).run();
+    for (const it of items) db.insert(collections).values({ ...it, clientId } as any).run();
+  }
+  async replaceLatePayments(clientId: number, items: Array<Omit<InsertLatePayment, "clientId">>): Promise<void> {
+    db.delete(latePayments).where(eq(latePayments.clientId, clientId)).run();
+    for (const it of items) db.insert(latePayments).values({ ...it, clientId } as any).run();
+  }
+  async replaceRepossessions(clientId: number, items: Array<Omit<InsertRepossession, "clientId">>): Promise<void> {
+    db.delete(repossessions).where(eq(repossessions.clientId, clientId)).run();
+    for (const it of items) db.insert(repossessions).values({ ...it, clientId } as any).run();
+  }
+  async replacePublicRecords(clientId: number, items: Array<Omit<InsertPublicRecord, "clientId">>): Promise<void> {
+    db.delete(publicRecords).where(eq(publicRecords.clientId, clientId)).run();
+    for (const it of items) db.insert(publicRecords).values({ ...it, clientId } as any).run();
+  }
 }
 
 export const storage = new DatabaseStorage();

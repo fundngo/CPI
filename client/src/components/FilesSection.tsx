@@ -16,8 +16,11 @@ import {
   Trash2,
   Download,
   Sparkles,
+  RefreshCw,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { useState } from "react";
+import { UpdateReviewModal } from "@/components/UpdateReviewModal";
 import { FILE_TYPES } from "@shared/schema";
 import type { FileType, UploadedFile } from "@shared/schema";
 import { fmtDate } from "@/lib/calculations";
@@ -76,6 +79,31 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/clients", clientId] });
       toast({ title: "File deleted" });
+    },
+  });
+
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<any>(null);
+
+  const previewMutation = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", `/api/clients/${clientId}/preview-from-files`, {});
+      return res.json();
+    },
+    onSuccess: (data: any) => {
+      setPreviewData(data);
+      setReviewOpen(true);
+      if (data?.errors?.length && !data.creditReport && !data.bankStatement) {
+        toast({
+          title: "Could not extract data",
+          description: data.errors.join("; "),
+          variant: "destructive",
+        });
+        setReviewOpen(false);
+      }
+    },
+    onError: (e: any) => {
+      toast({ title: "Update failed", description: e?.message || "Try again", variant: "destructive" });
     },
   });
 
@@ -157,22 +185,22 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
         </div>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <Button
-          variant="outline"
+          variant="default"
           size="sm"
           className="gap-2"
-          data-testid="button-auto-extract"
-          onClick={() =>
-            toast({
-              title: "Coming soon",
-              description: "This will parse credit report PDFs to auto-fill data.",
-            })
-          }
+          data-testid="button-refresh-from-files"
+          disabled={previewMutation.isPending || files.length === 0}
+          onClick={() => previewMutation.mutate()}
         >
-          <Sparkles className="h-4 w-4 text-accent" />
-          Auto-extract data
+          <RefreshCw className={`h-4 w-4 ${previewMutation.isPending ? "animate-spin" : ""}`} />
+          {previewMutation.isPending ? "Extracting…" : "Update from latest files"}
         </Button>
+        <div className="text-xs text-muted-foreground">
+          <Sparkles className="inline h-3 w-3 text-accent mr-1" />
+          Re-parses the most recent files — you'll review before anything saves.
+        </div>
       </div>
 
       <div className="space-y-4">
@@ -234,6 +262,13 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
           </div>
         )}
       </div>
+
+      <UpdateReviewModal
+        open={reviewOpen}
+        onOpenChange={setReviewOpen}
+        clientId={clientId}
+        preview={previewData}
+      />
     </div>
   );
 }

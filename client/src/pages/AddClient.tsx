@@ -432,7 +432,7 @@ function ReviewExtracted({
           <ExtractStat label="Repossessions" value={(data.repossessions || []).length} />
           <ExtractStat label="Public Records" value={(data.publicRecords || []).length} />
           <ExtractStat
-            label="Total Accounts"
+            label="Accounts Found"
             value={Number(data.totalAccountsCount) || (data.creditCards || []).length}
             sub={
               data.avgAccountAge

@@ -295,7 +295,7 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
           </div>
           <div>
             <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-1.5">
-              Total Accounts
+              Accounts Found
             </div>
             <div className="text-card-foreground font-semibold" data-testid="text-total-accounts">
               {client.totalAccountsCount}

@@ -10,6 +10,9 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 import Anthropic from "@anthropic-ai/sdk";
+// pdf-parse v2 exports a PDFParse class with .getText()
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { PDFParse } = require("pdf-parse");
 
 export async function registerRoutes(
   httpServer: Server,
@@ -20,15 +23,57 @@ export async function registerRoutes(
 
   await seedIfEmpty().catch((e) => console.error("Seed error:", e));
 
-  // Extract client data from a credit-report PDF using Claude
-  app.post("/api/extract-credit-report", async (req: Request, res: Response) => {
-    try {
-      const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
-      if (!fileBase64) return res.status(400).json({ message: "Missing fileBase64" });
-      // Strip data: prefix if present
-      const cleaned = fileBase64.includes(",") ? fileBase64.split(",")[1] : fileBase64;
+  // ====== Shared helpers for PDF extraction ======
 
-      const systemPrompt = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
+  async function extractPdfText(base64: string): Promise<{ text?: string; error?: string }> {
+    const cleaned = base64.includes(",") ? base64.split(",")[1] : base64;
+    try {
+      const pdfBuffer = Buffer.from(cleaned, "base64");
+      const parser = new PDFParse({ data: pdfBuffer });
+      const result = await parser.getText();
+      let pdfText = "";
+      if (typeof result?.text === "string") {
+        pdfText = result.text.trim();
+      } else if (Array.isArray(result?.pages)) {
+        pdfText = result.pages.map((p: any) => p.text || "").join("\n").trim();
+      }
+      await parser.destroy?.();
+      if (!pdfText || pdfText.length < 50) {
+        return { error: "This PDF has no readable text. It may be a scanned image — please try a text-based PDF or enter manually." };
+      }
+      const MAX_TEXT = 180000;
+      if (pdfText.length > MAX_TEXT) pdfText = pdfText.slice(0, MAX_TEXT);
+      return { text: pdfText };
+    } catch (err: any) {
+      console.error("PDF parse error:", err);
+      return { error: "Could not read this PDF. It may be image-only (scanned), password-protected, or corrupted." };
+    }
+  }
+
+  async function claudeJson(systemPrompt: string, userText: string): Promise<any> {
+    const client = new Anthropic();
+    const message = await client.messages.create({
+      model: "claude_sonnet_4_5" as any,
+      max_tokens: 4000,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userText }],
+    });
+    const text = (message.content || [])
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n")
+      .trim();
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    try {
+      return JSON.parse(stripped);
+    } catch {
+      const match = stripped.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("Could not parse extracted JSON");
+      return JSON.parse(match[0]);
+    }
+  }
+
+  const CREDIT_REPORT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
 {
   "name": string,
   "address": string,
@@ -59,52 +104,339 @@ export async function registerRoutes(
   "newestAccount": { "creditor": string, "year": number },
   "avgAccountAge": { "years": number, "months": number }
 }
-Extract from the attached credit report PDF. Dates use "YYYY-MM" format. lateHistory is a short summary like "1x60d 1x90d" or "24x90d" describing how many times late and severity. withinTwelveMonths is true if the most recent late payment occurred within the last 12 months from today. monthsSinceLate is the integer number of months between the most recent late date and today (use 0 if unknown). repossessions includes vehicle or asset repossessions — list each one. publicRecords includes bankruptcies, judgments, foreclosures, tax liens; recordType MUST be one of the listed values. If a field is unknown, use null (or empty string for required strings, 0 for numbers, [] for arrays). For accountStatus, use "Current" by default. Return ONLY the JSON object.`;
+Also include a comprehensive flat list named allAccounts containing EVERY tradeline you see, in this format:
+"allAccounts": [
+  { "creditor": string, "accountType": "Credit Card"|"Auto Loan"|"Mortgage"|"Student Loan"|"Personal Loan"|"Collection"|"Charge-Off"|"Repossession"|"Public Record"|"Other", "status": "Open"|"Closed"|"Paid"|"Current"|"Past Due"|"Charged Off"|"In Collection"|string, "openedYear": number|null, "balance": number|null }
+]
 
-      const client = new Anthropic();
-      const message = await client.messages.create({
-        model: "claude_sonnet_4_5" as any,
-        max_tokens: 4000,
-        system: systemPrompt,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "document",
-                source: { type: "base64", media_type: "application/pdf", data: cleaned },
-              } as any,
-              { type: "text", text: "Extract client data from this credit report PDF. Return ONLY the JSON object per the schema." },
-            ],
-          },
-        ],
-      });
+Extract from the attached credit report PDF. Dates use "YYYY-MM" format. lateHistory is a short summary like "1x60d 1x90d" or "24x90d" describing how many times late and severity. withinTwelveMonths is true if the most recent late payment occurred within the last 12 months from today. monthsSinceLate is the integer number of months between the most recent late date and today (use 0 if unknown). repossessions includes vehicle or asset repossessions — list each one. publicRecords includes bankruptcies, judgments, foreclosures, tax liens; recordType MUST be one of the listed values. For totalAccountsCount: count EVERY tradeline listed on the report — open AND closed/paid accounts, revolving + installment (auto, mortgage, student) + collections + charge-offs + public records. The value MUST equal allAccounts.length. List ALL accounts in their proper category arrays — credit cards (revolving) go in creditCards; auto loans, mortgages, student loans, personal loans go ONLY if they appear as charge-off/repossession/collection — but EVERY account regardless of type must appear in allAccounts. If a field is unknown, use null (or empty string for required strings, 0 for numbers, [] for arrays). For accountStatus, use "Current" by default. Return ONLY the JSON object.`;
 
-      const text = (message.content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text)
-        .join("\n")
-        .trim();
+  const BANK_STATEMENT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
+{
+  "bankName": string|null,
+  "accountHolderName": string|null,
+  "accounts": [
+    { "accountType": "Checking"|"Savings"|"Money Market"|"CD"|"Retirement"|"Business Checking"|"Business Savings"|"Other", "accountName": string, "lastFourDigits": string|null, "endingBalance": number|null, "averageBalance": number|null, "openedDate": string|null }
+  ],
+  "statementPeriod": { "start": string|null, "end": string|null },
+  "hasSavings": boolean,
+  "hasRetirement": boolean,
+  "isBusinessAccount": boolean,
+  "businessClassificationReason": string,
+  "totalDeposits": number|null,
+  "totalWithdrawals": number|null,
+  "notes": string|null
+}
+Extract from the attached bank statement text. Dates use "YYYY-MM" format. hasSavings = true if any account is Savings/Money Market/CD. hasRetirement = true only if a retirement/401k/IRA account is shown.
 
-      // Strip markdown fences if any
-      const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-      let parsed: any;
-      try {
-        parsed = JSON.parse(stripped);
-      } catch (err) {
-        // Try to extract first JSON object
-        const match = stripped.match(/\{[\s\S]*\}/);
-        if (!match) {
-          return res.status(422).json({ message: "Could not parse extracted data", raw: text });
-        }
-        parsed = JSON.parse(match[0]);
-      }
+CRITICAL FOR isBusinessAccount: classify based on the ACCOUNT HOLDER NAME on the statement, NOT the product name. Set isBusinessAccount=true ONLY if the account holder name contains a business entity suffix (LLC, L.L.C., Inc, Inc., Corp, Corporation, Ltd, LP, LLP, PLLC, Company, Co., Holdings, Trust, Foundation, DBA, or is clearly a non-person entity name). If the account holder is a natural person's name (e.g. "JOHN A SMITH", "TAMARA GUERRERO"), set isBusinessAccount=false EVEN IF the product is called "Business Checking" or similar. Some people open business-named products for personal use — the holder name is the ground truth. In businessClassificationReason, briefly explain (e.g. "holder name is 'TAMARA GUERRERO' — a personal name" or "holder name contains 'LLC'").
 
+If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
+
+  // ====== Endpoints ======
+
+  // Extract client data from a credit-report PDF (used by Add Client flow)
+  app.post("/api/extract-credit-report", async (req: Request, res: Response) => {
+    try {
+      const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
+      if (!fileBase64) return res.status(400).json({ message: "Missing fileBase64" });
+      const { text: pdfText, error } = await extractPdfText(fileBase64);
+      if (error || !pdfText) return res.status(422).json({ message: error || "No text" });
+      const parsed = await claudeJson(
+        CREDIT_REPORT_SCHEMA_PROMPT,
+        `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`
+      );
       res.json({ extracted: parsed, fileName: fileName || "credit-report.pdf" });
     } catch (e: any) {
       console.error("Extract error:", e);
       res.status(500).json({ message: e?.message || "Extraction failed" });
     }
+  });
+
+  // ====== Field-label registry for the review modal ======
+  const FIELD_LABELS: Record<string, { label: string; section: string; format?: "number" | "text" | "bool" | "money" | "percent" }> = {
+    recentCreditReport: { label: "Credit Score", section: "Credit Report", format: "text" },
+    totalAccountsCount: { label: "Accounts Found", section: "Credit Report", format: "number" },
+    creditUtilization: { label: "Credit Utilization", section: "Credit Report", format: "percent" },
+    chargeOffsCount: { label: "Charge-Offs", section: "Credit Report", format: "number" },
+    collectionsCount: { label: "Collections", section: "Credit Report", format: "number" },
+    repossessionsCount: { label: "Repossessions", section: "Credit Report", format: "number" },
+    publicRecordsCount: { label: "Public Records", section: "Credit Report", format: "number" },
+    latePaymentsCount: { label: "Late Payments (total)", section: "Credit Report", format: "number" },
+    latePaymentsWithin12moCount: { label: "Late — within 12mo", section: "Credit Report", format: "number" },
+    latePayments12to24moCount: { label: "Late — 12–24mo", section: "Credit Report", format: "number" },
+    latePaymentsOlder24moCount: { label: "Late — over 24mo", section: "Credit Report", format: "number" },
+    oldestAccountCreditor: { label: "Oldest Account Creditor", section: "Credit Report", format: "text" },
+    oldestAccountYear: { label: "Oldest Account Year", section: "Credit Report", format: "number" },
+    newestAccountCreditor: { label: "Newest Account Creditor", section: "Credit Report", format: "text" },
+    newestAccountYear: { label: "Newest Account Year", section: "Credit Report", format: "number" },
+    avgAccountAgeYears: { label: "Avg Account Age (years)", section: "Credit Report", format: "number" },
+    avgAccountAgeMonths: { label: "Avg Account Age (months)", section: "Credit Report", format: "number" },
+    creditAnalysisDate: { label: "Credit Analysis Date", section: "Credit Report", format: "text" },
+    // Tables (treated as one row each in the review modal)
+    __cards: { label: "Credit Cards (replace all)", section: "Credit Report", format: "text" },
+    __chargeOffs: { label: "Charge-Offs (replace all)", section: "Credit Report", format: "text" },
+    __collections: { label: "Collections (replace all)", section: "Credit Report", format: "text" },
+    __latePayments: { label: "Late Payments (replace all)", section: "Credit Report", format: "text" },
+    __repossessions: { label: "Repossessions (replace all)", section: "Credit Report", format: "text" },
+    __publicRecords: { label: "Public Records (replace all)", section: "Credit Report", format: "text" },
+    // Bank fields
+    numBankAccounts: { label: "# Personal Bank Accounts", section: "Banking", format: "number" },
+    bankAccountsList: { label: "Personal Bank Accounts", section: "Banking", format: "text" },
+    hasSavings: { label: "Has Savings", section: "Banking", format: "bool" },
+    hasRetirement401k: { label: "Has Retirement / 401k", section: "Banking", format: "bool" },
+    hasBusinessAccounts: { label: "Has Business Accounts", section: "Banking", format: "bool" },
+    businessAccountsList: { label: "Business Bank Accounts", section: "Banking", format: "text" },
+  };
+
+  // Build the credit-report patch + parsed payload
+  async function buildCreditReportPatch(parsed: any) {
+    const patch: any = {};
+    if (parsed.creditScore != null && parsed.creditScoreSource) {
+      patch.recentCreditReport = `${parsed.creditScore} (${parsed.creditScoreSource})`;
+    } else if (parsed.creditScore != null) {
+      patch.recentCreditReport = String(parsed.creditScore);
+    }
+    if (parsed.totalAccountsCount != null) patch.totalAccountsCount = Number(parsed.totalAccountsCount) || 0;
+    if (parsed.oldestAccount) {
+      patch.oldestAccountCreditor = parsed.oldestAccount.creditor || "";
+      patch.oldestAccountYear = Number(parsed.oldestAccount.year) || 0;
+    }
+    if (parsed.newestAccount) {
+      patch.newestAccountCreditor = parsed.newestAccount.creditor || "";
+      patch.newestAccountYear = Number(parsed.newestAccount.year) || 0;
+    }
+    if (parsed.avgAccountAge) {
+      patch.avgAccountAgeYears = Number(parsed.avgAccountAge.years) || 0;
+      patch.avgAccountAgeMonths = Number(parsed.avgAccountAge.months) || 0;
+    }
+    patch.chargeOffsCount = (parsed.chargeOffs || []).length;
+    patch.collectionsCount = (parsed.collections || []).length;
+    patch.repossessionsCount = (parsed.repossessions || []).length;
+    patch.publicRecordsCount = (parsed.publicRecords || []).length;
+    const lp = (parsed.latePayments || []) as any[];
+    patch.latePaymentsCount = lp.length;
+    patch.latePaymentsWithin12moCount = lp.filter((l) => l.withinTwelveMonths || (l.monthsSinceLate != null && l.monthsSinceLate <= 12)).length;
+    patch.latePayments12to24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 12 && l.monthsSinceLate <= 24).length;
+    patch.latePaymentsOlder24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 24).length;
+    const cards = (parsed.creditCards || []) as any[];
+    const totalLimit = cards.reduce((s, c) => s + (Number(c.creditLimit) || 0), 0);
+    const totalBal = cards.reduce((s, c) => s + (Number(c.currentBalance) || 0), 0);
+    if (totalLimit > 0) patch.creditUtilization = Math.round((totalBal / totalLimit) * 100);
+    patch.creditAnalysisDate = new Date().toISOString().slice(0, 10);
+    return patch;
+  }
+
+  function buildBankPatch(parsed: any) {
+    const accounts = (parsed.accounts || []) as any[];
+    const isBiz = !!parsed.isBusinessAccount;
+    const patch: any = {};
+    if (isBiz) {
+      patch.hasBusinessAccounts = true;
+      patch.businessAccountsList = accounts.map((a) => a.accountName || a.accountType).filter(Boolean).join(", ");
+    } else {
+      patch.numBankAccounts = accounts.length;
+      patch.bankAccountsList = accounts.map((a) => `${a.accountName || a.accountType}${a.lastFourDigits ? ` (…${a.lastFourDigits})` : ""}`).join(", ");
+      if (typeof parsed.hasSavings === "boolean") patch.hasSavings = parsed.hasSavings;
+      if (typeof parsed.hasRetirement === "boolean") patch.hasRetirement401k = parsed.hasRetirement;
+    }
+    return { patch, isBiz, accounts };
+  }
+
+  function diffPatch(current: any, patch: any) {
+    // Return [{ key, label, section, format, currentValue, proposedValue, changed }]
+    const out: any[] = [];
+    for (const key of Object.keys(patch)) {
+      const meta = FIELD_LABELS[key];
+      if (!meta) continue;
+      const cur = (current as any)[key];
+      const next = patch[key];
+      const changed = String(cur ?? "") !== String(next ?? "");
+      out.push({ key, label: meta.label, section: meta.section, format: meta.format || "text", currentValue: cur, proposedValue: next, changed });
+    }
+    return out;
+  }
+
+  // PREVIEW: re-extract from latest files, return proposed changes without writing
+  app.post("/api/clients/:id/preview-from-files", async (req: Request, res: Response) => {
+    const clientId = Number(req.params.id);
+    if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    const client = await storage.getClient(clientId);
+    if (!client) return res.status(404).json({ message: "Client not found" });
+
+    const allFiles = client.files || [];
+    const latestOf = (type: string) => {
+      const list = allFiles.filter((f: any) => f.fileType === type);
+      if (list.length === 0) return undefined;
+      return list.sort((a: any, b: any) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""))[0];
+    };
+    const latestCreditReport = latestOf("credit_report");
+    const latestBankStatement = latestOf("bank_statement");
+
+    if (!latestCreditReport && !latestBankStatement) {
+      return res.status(400).json({ message: "No credit report or bank statement uploaded yet. Upload a PDF first, then click Update again." });
+    }
+
+    const out: any = { errors: [], creditReport: null, bankStatement: null };
+
+    if (latestCreditReport) {
+      try {
+        const fullFile = await storage.getFile(latestCreditReport.id);
+        const base64 = (fullFile as any)?.base64Content;
+        if (!base64) throw new Error("Credit report file has no content stored");
+        const { text: pdfText, error } = await extractPdfText(base64);
+        if (error || !pdfText) throw new Error(error || "No text in credit report PDF");
+        const parsed = await claudeJson(
+          CREDIT_REPORT_SCHEMA_PROMPT,
+          `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`
+        );
+        const patch = await buildCreditReportPatch(parsed);
+        const fieldDiffs = diffPatch(client, patch);
+        // Table-level diffs: just count comparisons
+        const tableDiffs: any[] = [];
+        const tableSpecs: Array<[string, string, any[], number]> = [
+          ["__cards", "Credit Cards (replace all)", parsed.creditCards || [], (client as any).creditCards?.length || 0],
+          ["__chargeOffs", "Charge-Offs (replace all)", parsed.chargeOffs || [], (client as any).chargeOffs?.length || 0],
+          ["__collections", "Collections (replace all)", parsed.collections || [], (client as any).collections?.length || 0],
+          ["__latePayments", "Late Payments (replace all)", parsed.latePayments || [], (client as any).latePayments?.length || 0],
+          ["__repossessions", "Repossessions (replace all)", parsed.repossessions || [], (client as any).repossessions?.length || 0],
+          ["__publicRecords", "Public Records (replace all)", parsed.publicRecords || [], (client as any).publicRecords?.length || 0],
+        ];
+        for (const [key, label, newList, currentCount] of tableSpecs) {
+          tableDiffs.push({
+            key, label, section: "Credit Report", format: "text",
+            currentValue: `${currentCount} item${currentCount === 1 ? "" : "s"}`,
+            proposedValue: `${newList.length} item${newList.length === 1 ? "" : "s"}`,
+            changed: currentCount !== newList.length || newList.length > 0,
+          });
+        }
+        out.creditReport = {
+          fileName: latestCreditReport.fileName,
+          fileId: latestCreditReport.id,
+          diffs: [...fieldDiffs, ...tableDiffs],
+          allAccounts: parsed.allAccounts || [],
+          parsed, // store full parsed payload so apply doesn't re-run Claude
+        };
+      } catch (e: any) {
+        console.error("Credit report preview error:", e);
+        out.errors.push(`Credit report (${latestCreditReport.fileName}): ${e?.message || "failed"}`);
+      }
+    }
+
+    if (latestBankStatement) {
+      try {
+        const fullFile = await storage.getFile(latestBankStatement.id);
+        const base64 = (fullFile as any)?.base64Content;
+        if (!base64) throw new Error("Bank statement file has no content stored");
+        const { text: pdfText, error } = await extractPdfText(base64);
+        if (error || !pdfText) throw new Error(error || "No text in bank statement PDF");
+        const parsed = await claudeJson(
+          BANK_STATEMENT_SCHEMA_PROMPT,
+          `Extract bank account info from this statement text. Return ONLY the JSON object per the schema.\n\n--- BANK STATEMENT TEXT ---\n${pdfText}\n--- END ---`
+        );
+        const { patch, isBiz, accounts } = buildBankPatch(parsed);
+        const diffs = diffPatch(client, patch);
+        out.bankStatement = {
+          fileName: latestBankStatement.fileName,
+          fileId: latestBankStatement.id,
+          accountHolderName: parsed.accountHolderName || null,
+          bankName: parsed.bankName || null,
+          isBusinessAccount: isBiz,
+          businessClassificationReason: parsed.businessClassificationReason || null,
+          accountsFound: accounts.length,
+          accounts,
+          diffs,
+          parsed,
+        };
+      } catch (e: any) {
+        console.error("Bank statement preview error:", e);
+        out.errors.push(`Bank statement (${latestBankStatement.fileName}): ${e?.message || "failed"}`);
+      }
+    }
+
+    res.json(out);
+  });
+
+  // APPLY: receive selected fields + parsed payloads, write to DB
+  app.post("/api/clients/:id/apply-from-files", async (req: Request, res: Response) => {
+    const clientId = Number(req.params.id);
+    if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    const client = await storage.getClient(clientId);
+    if (!client) return res.status(404).json({ message: "Client not found" });
+
+    const { acceptedKeys, creditReportParsed, bankStatementParsed } = req.body as {
+      acceptedKeys: string[];
+      creditReportParsed?: any;
+      bankStatementParsed?: any;
+    };
+    if (!Array.isArray(acceptedKeys)) return res.status(400).json({ message: "acceptedKeys required" });
+    const accept = new Set(acceptedKeys);
+
+    // Credit report scalar patch
+    if (creditReportParsed) {
+      const fullPatch = await buildCreditReportPatch(creditReportParsed);
+      const filtered: any = {};
+      for (const k of Object.keys(fullPatch)) if (accept.has(k)) filtered[k] = fullPatch[k];
+      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
+
+      // Table replacements: only if user accepted that table
+      if (accept.has("__cards")) {
+        await storage.replaceCards(clientId, (creditReportParsed.creditCards || []).map((c: any) => ({
+          cardName: c.cardName || "", issuer: c.issuer || "",
+          creditLimit: Number(c.creditLimit) || 0, currentBalance: Number(c.currentBalance) || 0,
+          minimumPayment: c.minimumPayment != null ? Number(c.minimumPayment) : null,
+          paymentDueDate: c.paymentDueDate || "", accountStatus: c.accountStatus || "Current", notes: "",
+        })));
+      }
+      if (accept.has("__chargeOffs")) {
+        await storage.replaceChargeOffs(clientId, (creditReportParsed.chargeOffs || []).map((c: any) => ({
+          creditor: c.creditor || "", accountType: c.accountType || "",
+          originalAmount: Number(c.originalAmount) || 0, balance: Number(c.balance) || 0,
+          openedDate: c.openedDate || "", closedDate: c.closedDate || "", notes: "",
+        })));
+      }
+      if (accept.has("__collections")) {
+        await storage.replaceCollections(clientId, (creditReportParsed.collections || []).map((c: any) => ({
+          creditor: c.creditor || "", originalCreditor: c.originalCreditor || "",
+          balance: Number(c.balance) || 0, reportedDate: c.reportedDate || "", notes: "",
+        })));
+      }
+      if (accept.has("__latePayments")) {
+        await storage.replaceLatePayments(clientId, (creditReportParsed.latePayments || []).map((l: any) => ({
+          creditor: l.creditor || "", accountType: l.accountType || "",
+          status: l.status || "Open", mostRecentLateDate: l.mostRecentLateDate || "",
+          lateHistory: l.lateHistory || "",
+          withinTwelveMonths: !!l.withinTwelveMonths,
+          monthsSinceLate: Number(l.monthsSinceLate) || 0,
+        })));
+      }
+      if (accept.has("__repossessions")) {
+        await storage.replaceRepossessions(clientId, (creditReportParsed.repossessions || []).map((r: any) => ({
+          creditor: r.creditor || "", accountType: r.accountType || "",
+          originalAmount: Number(r.originalAmount) || 0, balance: Number(r.balance) || 0,
+          openedDate: r.openedDate || "", repoDate: r.repoDate || "",
+          status: r.status || "", notes: "",
+        })));
+      }
+      if (accept.has("__publicRecords")) {
+        await storage.replacePublicRecords(clientId, (creditReportParsed.publicRecords || []).map((p: any) => ({
+          recordType: (p.recordType || "Other"),
+          courtOrAgency: p.courtOrAgency || "", referenceNumber: p.referenceNumber || "",
+          amount: Number(p.amount) || 0, status: p.status || "",
+          filedDate: p.filedDate || "", notes: "",
+        })));
+      }
+    }
+
+    if (bankStatementParsed) {
+      const { patch } = buildBankPatch(bankStatementParsed);
+      const filtered: any = {};
+      for (const k of Object.keys(patch)) if (accept.has(k)) filtered[k] = patch[k];
+      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
+    }
+
+    const refreshed = await storage.getClient(clientId);
+    res.json({ ok: true, client: refreshed });
   });
 
   app.get("/api/clients", async (_req: Request, res: Response) => {
