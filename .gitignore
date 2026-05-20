@@ -13,12 +13,13 @@ data.db-journal
 .env.*
 !.env.example
 
-# Screenshots and dev artifacts
-*.png
-*.jpg
-*.jpeg
-screenshot.png
-
 # Logs and OS files
 *.log
 .DS_Store
+
+# Loose screenshots / dev artifacts at the repo root
+# (we still want images under client/src/assets/ and other source dirs)
+/*.png
+/*.jpg
+/*.jpeg
+/screenshot.png
