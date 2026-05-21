@@ -50,11 +50,46 @@ export async function registerRoutes(
     }
   }
 
+  // Attempt to repair JSON that was truncated mid-array/object by Claude max_tokens.
+  // Strategy: walk the string, track string/escape/bracket state, then trim back to
+  // the last complete element and auto-close open arrays/objects.
+  function repairTruncatedJson(input: string): string {
+    let depth: string[] = []; // stack of '{' or '['
+    let inString = false;
+    let escape = false;
+    let lastSafe = -1; // index after the last complete top-level-ish element
+    let lastSafeDepth: string[] = [];
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (escape) { escape = false; continue; }
+      if (inString) {
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === "{" || ch === "[") { depth.push(ch); continue; }
+      if (ch === "}" || ch === "]") { depth.pop(); continue; }
+      if (ch === "," && depth.length > 0) {
+        // safe truncation point inside the innermost container
+        lastSafe = i;
+        lastSafeDepth = [...depth];
+      }
+    }
+    let trimmed = lastSafe > 0 ? input.slice(0, lastSafe) : input;
+    let closingDepth = lastSafe > 0 ? lastSafeDepth : depth;
+    // close any open containers
+    for (let i = closingDepth.length - 1; i >= 0; i--) {
+      trimmed += closingDepth[i] === "{" ? "}" : "]";
+    }
+    return trimmed;
+  }
+
   async function claudeJson(systemPrompt: string, userText: string): Promise<any> {
     const client = new Anthropic();
     const message = await client.messages.create({
       model: "claude_sonnet_4_5" as any,
-      max_tokens: 4000,
+      max_tokens: 16000,
       system: systemPrompt,
       messages: [{ role: "user", content: userText }],
     });
@@ -64,12 +99,27 @@ export async function registerRoutes(
       .join("\n")
       .trim();
     const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    // First try direct parse
     try {
       return JSON.parse(stripped);
-    } catch {
-      const match = stripped.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("Could not parse extracted JSON");
-      return JSON.parse(match[0]);
+    } catch {}
+    // Try extracting the outermost {...}
+    const match = stripped.match(/\{[\s\S]*\}/);
+    const candidate = match ? match[0] : stripped;
+    try {
+      return JSON.parse(candidate);
+    } catch (firstErr: any) {
+      // Truncation repair fallback
+      try {
+        const repaired = repairTruncatedJson(candidate);
+        const parsed = JSON.parse(repaired);
+        console.warn("claudeJson: parsed after truncation repair");
+        return parsed;
+      } catch {
+        throw new Error(
+          "Could not parse extracted JSON: " + (firstErr?.message || "unknown error")
+        );
+      }
     }
   }
 
