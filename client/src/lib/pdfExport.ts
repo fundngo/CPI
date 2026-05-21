@@ -60,6 +60,11 @@ export function generateClientPdf(client: ClientWithDetails) {
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
+  if ((client as any).address) {
+    const addrLines = doc.splitTextToSize(String((client as any).address), W - margin * 2);
+    doc.text(addrLines, margin, y);
+    y += addrLines.length * 12 + 2;
+  }
   const contact = [client.phone, client.email].filter(Boolean).join("  ·  ");
   if (contact) {
     doc.text(contact, margin, y);
@@ -75,52 +80,58 @@ export function generateClientPdf(client: ClientWithDetails) {
   const pbs = personalBankingStrength(client);
   const bbs = businessBankingStrength(client);
 
+  // Summary box — 4 evenly distributed columns inside the grey card
+  const boxW = W - margin * 2;
+  const colW = boxW / 4;
+  const colX = (i: number) => margin + colW * i + 16; // 16pt inset from each column edge
   doc.setDrawColor(220, 224, 232);
   doc.setFillColor(...muted);
-  doc.roundedRect(margin, y, W - margin * 2, 88, 6, 6, "FD");
+  doc.roundedRect(margin, y, boxW, 88, 6, 6, "FD");
 
   doc.setTextColor(...slate);
   doc.setFont("helvetica", "bold");
   doc.setFontSize(9);
-  doc.text("FUNDING READINESS", margin + 16, y + 22);
-  doc.text("PERSONAL BANKING", margin + 150, y + 22);
-  doc.text("BUSINESS BANKING", margin + 290, y + 22);
-  doc.text("OVERALL UTILIZATION", margin + 430, y + 22);
+  doc.text("FUNDING READINESS", colX(0), y + 22);
+  doc.text("PERSONAL BANKING", colX(1), y + 22);
+  doc.text("BUSINESS BANKING", colX(2), y + 22);
+  doc.text("OVERALL UTILIZATION", colX(3), y + 22);
 
   doc.setTextColor(...navy);
   doc.setFontSize(22);
-  doc.text(`${score}`, margin + 16, y + 52);
+  doc.text(`${score}`, colX(0), y + 52);
   doc.setFontSize(11);
   doc.setFont("helvetica", "normal");
   doc.setTextColor(...slate);
-  doc.text(scoreLabel, margin + 16, y + 70);
+  doc.text(scoreLabel, colX(0), y + 70);
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(22);
   doc.setTextColor(...navy);
-  doc.text(`${pbs}`, margin + 150, y + 52);
+  const pbsX = colX(1);
+  doc.text(`${pbs}`, pbsX, y + 52);
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
-  doc.text("/ 100", margin + 180, y + 52);
+  doc.text("/ 100", pbsX + 30, y + 52);
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(22);
   doc.setTextColor(...navy);
-  doc.text(`${bbs}`, margin + 290, y + 52);
+  const bbsX = colX(2);
+  doc.text(`${bbs}`, bbsX, y + 52);
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
-  doc.text("/ 100", margin + 320, y + 52);
+  doc.text("/ 100", bbsX + 30, y + 52);
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(22);
   doc.setTextColor(util >= 50 ? 200 : util >= 30 ? 220 : 40, util >= 50 ? 50 : util >= 30 ? 140 : 158, util >= 50 ? 50 : util >= 30 ? 30 : 110);
-  doc.text(`${util.toFixed(0)}%`, margin + 430, y + 52);
+  doc.text(`${util.toFixed(0)}%`, colX(3), y + 52);
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
-  doc.text(utilizationStatus(util), margin + 430, y + 70);
+  doc.text(utilizationStatus(util), colX(3), y + 70);
 
   y += 108;
 
@@ -187,15 +198,30 @@ export function generateClientPdf(client: ClientWithDetails) {
 
   if (client.creditCards.length) {
     ensure(24);
+    // Column layout (pt), tuned so issuer text doesn't collide with limit:
+    // CARD: margin .. margin+140 (left)
+    // ISSUER: margin+150 .. margin+260 (left)
+    // LIMIT: right-aligned at margin+320
+    // BALANCE: right-aligned at margin+380
+    // UTIL: right-aligned at margin+420
+    // STATUS: left at margin+440
+    const cardCol = margin;
+    const issuerCol = margin + 150;
+    const issuerMaxW = 100; // 150..250 area; right edge ~260 before LIMIT right-aligns at 320
+    const limitCol = margin + 320;
+    const balanceCol = margin + 380;
+    const utilCol = margin + 425;
+    const statusCol = margin + 445;
+
     doc.setFont("helvetica", "bold");
     doc.setFontSize(9);
     doc.setTextColor(...slate);
-    doc.text("CARD", margin, y);
-    doc.text("ISSUER", margin + 140, y);
-    doc.text("LIMIT", margin + 240, y, { align: "right" });
-    doc.text("BALANCE", margin + 320, y, { align: "right" });
-    doc.text("UTIL", margin + 380, y, { align: "right" });
-    doc.text("STATUS", margin + 420, y);
+    doc.text("CARD", cardCol, y);
+    doc.text("ISSUER", issuerCol, y);
+    doc.text("LIMIT", limitCol, y, { align: "right" });
+    doc.text("BALANCE", balanceCol, y, { align: "right" });
+    doc.text("UTIL", utilCol, y, { align: "right" });
+    doc.text("STATUS", statusCol, y);
     y += 6;
     doc.setDrawColor(220, 224, 232);
     doc.line(margin, y, W - margin, y);
@@ -205,12 +231,14 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.setTextColor(40, 50, 70);
     for (const card of client.creditCards) {
       ensure(16);
-      doc.text(card.cardName || "—", margin, y);
-      doc.text(card.issuer || "—", margin + 140, y);
-      doc.text(fmtCurrency(card.creditLimit), margin + 240, y, { align: "right" });
-      doc.text(fmtCurrency(card.currentBalance), margin + 320, y, { align: "right" });
-      doc.text(`${cardUtilization(card).toFixed(0)}%`, margin + 380, y, { align: "right" });
-      doc.text(card.accountStatus, margin + 420, y);
+      const cardName = doc.splitTextToSize(card.cardName || "—", 140);
+      const issuer = doc.splitTextToSize(card.issuer || "—", issuerMaxW);
+      doc.text(cardName[0], cardCol, y);
+      doc.text(issuer[0], issuerCol, y);
+      doc.text(fmtCurrency(card.creditLimit), limitCol, y, { align: "right" });
+      doc.text(fmtCurrency(card.currentBalance), balanceCol, y, { align: "right" });
+      doc.text(`${cardUtilization(card).toFixed(0)}%`, utilCol, y, { align: "right" });
+      doc.text(card.accountStatus, statusCol, y);
       y += 14;
     }
   }
@@ -232,7 +260,9 @@ export function generateClientPdf(client: ClientWithDetails) {
     sectionHeader("Recommended Next Steps");
     for (const s of steps) {
       ensure(14);
-      const lines = doc.splitTextToSize(`→  ${s}`, W - margin * 2);
+      // Use a plain ASCII bullet — jsPDF default helvetica (WinAnsi) mangles the
+      // U+2192 arrow into garbled glyphs like "I'".
+      const lines = doc.splitTextToSize(`•  ${s}`, W - margin * 2);
       doc.text(lines, margin, y);
       y += lines.length * 14;
     }

@@ -149,9 +149,6 @@ export default function AddClient() {
           ? `${extracted.creditScore}${extracted.creditScoreSource ? ` (${extracted.creditScoreSource})` : ""}`
           : "";
 
-      // Compose initial notes with address
-      const personalNotes = extracted.address ? `Address: ${extracted.address}` : "";
-
       const today = new Date().toISOString().slice(0, 10);
       const chargeOffsList = extracted.chargeOffs || [];
       const collectionsList = extracted.collections || [];
@@ -168,12 +165,13 @@ export default function AddClient() {
 
       const clientPayload: any = {
         name: extracted.name || "Unnamed Client",
+        address: extracted.address || "",
         phone: extracted.phone || "",
         email: extracted.email || "",
         onboardingDate: today,
         status: "New" as const,
         recentCreditReport: reportSummary,
-        personalNotes,
+        personalNotes: "",
         creditAnalysisDate: today,
         chargeOffsCount: chargeOffsList.length,
         collectionsCount: collectionsList.length,

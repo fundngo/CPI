@@ -121,6 +121,11 @@ export default function ClientProfile() {
             </h1>
             <StatusBadge status={client.status as ClientStatus} />
           </div>
+          {client.address && (
+            <div className="mt-1.5 text-sm text-white/70" data-testid="text-client-address">
+              {client.address}
+            </div>
+          )}
           <div className="flex items-center gap-4 mt-2 text-sm text-white/70 flex-wrap">
             <span className="flex items-center gap-1.5" data-testid="text-client-phone">
               <Phone className="h-3.5 w-3.5" />

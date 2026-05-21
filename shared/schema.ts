@@ -32,6 +32,7 @@ export type FileType = (typeof FILE_TYPES)[number];
 export const clients = sqliteTable("clients", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
+  address: text("address").notNull().default(""),
   phone: text("phone").notNull().default(""),
   email: text("email").notNull().default(""),
   onboardingDate: text("onboarding_date").notNull().default(""),

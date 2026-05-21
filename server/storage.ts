@@ -42,6 +42,7 @@ sqlite.exec(`
 CREATE TABLE IF NOT EXISTS clients (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
+  address TEXT NOT NULL DEFAULT '',
   phone TEXT NOT NULL DEFAULT '',
   email TEXT NOT NULL DEFAULT '',
   onboarding_date TEXT NOT NULL DEFAULT '',
@@ -177,6 +178,19 @@ CREATE TABLE IF NOT EXISTS uploaded_files (
   base64_content TEXT NOT NULL DEFAULT ''
 );
 `);
+
+// ---- Lightweight migrations for existing DBs (idempotent) ----
+function columnExists(table: string, column: string): boolean {
+  try {
+    const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    return rows.some((r) => r.name === column);
+  } catch {
+    return false;
+  }
+}
+if (!columnExists("clients", "address")) {
+  sqlite.exec(`ALTER TABLE clients ADD COLUMN address TEXT NOT NULL DEFAULT ''`);
+}
 
 export const db = drizzle(sqlite);
 
