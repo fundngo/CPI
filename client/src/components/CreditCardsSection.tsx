@@ -17,7 +17,7 @@ export function CreditCardsSection({ cards }: { clientId?: number; cards: Credit
 
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="border border-border rounded-lg overflow-hidden grid grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0 divide-border">
         <Metric label="Total Cards" value={cards.length.toString()} testId="metric-total-cards" />
         <Metric label="Total Limit" value={fmtCurrency(totalCreditLimit(cards))} testId="metric-total-limit" />
         <Metric label="Total Balance" value={fmtCurrency(totalBalance(cards))} testId="metric-total-balance" />
@@ -97,7 +97,7 @@ function Metric({
   testId?: string;
 }) {
   return (
-    <div className="rounded-lg border border-border bg-card px-4 py-3">
+    <div className="bg-card px-4 py-3">
       <div className="text-xs text-muted-foreground uppercase tracking-wide font-medium">{label}</div>
       <div className="text-lg font-semibold tabular-nums mt-1" style={color ? { color } : undefined} data-testid={testId}>
         {value}

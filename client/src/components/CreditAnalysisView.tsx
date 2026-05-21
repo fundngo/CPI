@@ -205,114 +205,53 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
 
   return (
     <div className="space-y-6" data-testid="credit-analysis-view">
-      {/* KPI summary — table-style grid matching the credit reports tables */}
-      <div
-        className="rounded-xl border border-card-border bg-card shadow-xl ring-1 ring-white/5 overflow-hidden"
-        data-testid="credit-kpi-grid"
-      >
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border/60">
-                <th className="px-5 py-3 text-left text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-                  Metric
-                </th>
-                <th className="px-5 py-3 text-right text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-                  Count
-                </th>
-                <th className="px-5 py-3 text-left text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-                  Detail
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {[
-                {
-                  key: "charge-offs",
-                  label: "Charge-Offs",
-                  icon: TrendingDown,
-                  value: client.chargeOffsCount,
-                  detail: client.chargeOffsCount > 0 ? "Active negative items" : "None on file",
-                  negative: client.chargeOffsCount > 0,
-                },
-                {
-                  key: "collections",
-                  label: "Collections",
-                  icon: AlertTriangle,
-                  value: client.collectionsCount,
-                  detail: client.collectionsCount > 0 ? "Accounts in collection" : "None on file",
-                  negative: client.collectionsCount > 0,
-                },
-                {
-                  key: "late-payments",
-                  label: "Late Payments",
-                  icon: Clock,
-                  value: client.latePaymentsCount,
-                  detail:
-                    client.latePaymentsCount > 0
-                      ? `${client.latePaymentsWithin12moCount} within 12mo · ${client.latePayments12to24moCount} (12–24mo) · ${client.latePaymentsOlder24moCount} (>24mo)`
-                      : "No late payments",
-                  negative: client.latePaymentsCount > 0,
-                },
-                {
-                  key: "repossessions",
-                  label: "Repossessions",
-                  icon: Car,
-                  value: client.repossessionsCount,
-                  detail: client.repossessionsCount > 0 ? "Vehicle or asset repos" : "None on file",
-                  negative: client.repossessionsCount > 0,
-                },
-                {
-                  key: "public-records",
-                  label: "Public Records",
-                  icon: Gavel,
-                  value: client.publicRecordsCount,
-                  detail:
-                    client.publicRecordsCount > 0
-                      ? "Bankruptcies, judgments, liens"
-                      : "None on file",
-                  negative: client.publicRecordsCount > 0,
-                },
-                {
-                  key: "avg-age",
-                  label: "Avg Account Age",
-                  icon: Calendar,
-                  value: ageValue,
-                  detail: `${client.totalAccountsCount} accounts found`,
-                  negative: false,
-                },
-              ].map((row, i, arr) => {
-                const Icon = row.icon;
-                return (
-                  <tr
-                    key={row.key}
-                    className={i !== arr.length - 1 ? "border-b border-border/60" : ""}
-                    data-testid={`kpi-row-${row.key}`}
-                  >
-                    <td className="px-5 py-3.5">
-                      <div className="flex items-center gap-2.5">
-                        <Icon
-                          className={`h-4 w-4 ${row.negative ? "text-destructive" : "text-accent"}`}
-                        />
-                        <span className="font-medium text-card-foreground">{row.label}</span>
-                      </div>
-                    </td>
-                    <td className="px-5 py-3.5 text-right">
-                      <span
-                        className={`font-semibold text-base ${
-                          row.negative ? "text-destructive" : "text-card-foreground"
-                        }`}
-                      >
-                        {row.value}
-                      </span>
-                    </td>
-                    <td className="px-5 py-3.5 text-muted-foreground text-xs">{row.detail}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+      {/* KPI summary — floating cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <CreditKPICard
+          label="Charge-Offs"
+          value={client.chargeOffsCount}
+          icon={TrendingDown}
+          tint={client.chargeOffsCount > 0 ? "negative" : "neutral"}
+          testId="kpi-charge-offs"
+        />
+        <CreditKPICard
+          label="Collections"
+          value={client.collectionsCount}
+          icon={AlertTriangle}
+          tint={client.collectionsCount > 0 ? "negative" : "neutral"}
+          testId="kpi-collections"
+        />
+        <CreditKPICard
+          label="Late Payments"
+          value={client.latePaymentsCount}
+          icon={Clock}
+          tint={client.latePaymentsCount > 0 ? "negative" : "neutral"}
+          testId="kpi-late-payments"
+        />
+        <CreditKPICard
+          label="Avg Account Age"
+          value={ageValue}
+          subStat={`${client.totalAccountsCount} total accounts`}
+          icon={Calendar}
+          tint="neutral"
+          testId="kpi-avg-age"
+        />
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <CreditKPICard
+          label="Repossessions"
+          value={client.repossessionsCount}
+          icon={Car}
+          tint={client.repossessionsCount > 0 ? "negative" : "neutral"}
+          testId="kpi-repossessions"
+        />
+        <CreditKPICard
+          label="Public Records"
+          value={client.publicRecordsCount}
+          icon={Gavel}
+          tint={client.publicRecordsCount > 0 ? "negative" : "neutral"}
+          testId="kpi-public-records"
+        />
       </div>
 
       {/* Credit Age Overview */}
