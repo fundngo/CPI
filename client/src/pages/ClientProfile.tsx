@@ -81,7 +81,7 @@ export default function ClientProfile() {
 
   if (isLoading || !client) {
     return (
-      <div className="px-10 py-10 max-w-3xl mx-auto space-y-6">
+      <div className="px-6 sm:px-10 py-10 max-w-5xl mx-auto space-y-6">
         <Skeleton className="h-10 w-64" />
         <Skeleton className="h-48 w-full rounded-xl" />
         <Skeleton className="h-64 w-full rounded-xl" />
@@ -100,7 +100,7 @@ export default function ClientProfile() {
   const utilStat = utilizationStatus(util);
 
   return (
-    <div className="px-6 sm:px-10 py-10 max-w-3xl mx-auto pb-28">
+    <div className="px-6 sm:px-10 py-10 max-w-5xl mx-auto pb-28">
       <Button
         variant="ghost"
         size="sm"
