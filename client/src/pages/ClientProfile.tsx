@@ -205,7 +205,7 @@ export default function ClientProfile() {
             }`}
             data-testid="tab-credit-analysis"
           >
-            Credit Analysis
+            Credit Report Analysis
           </button>
         </div>
         {activeTab === "credit-analysis" && client.creditAnalysisDate && (
