@@ -5,7 +5,6 @@ import { useToast } from "@/hooks/use-toast";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
@@ -13,7 +12,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { ChevronDown, AlertTriangle, FileText, Banknote, CheckCircle2 } from "lucide-react";
+import { ChevronDown, AlertTriangle, FileText, Banknote, CheckCircle2, Eye, EyeOff } from "lucide-react";
 
 type Diff = {
   key: string;
@@ -77,6 +76,7 @@ export function UpdateReviewModal({
   const { toast } = useToast();
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [accountsExpanded, setAccountsExpanded] = useState(false);
+  const [showUnchanged, setShowUnchanged] = useState(false);
 
   // Auto-tick rows that actually changed
   useEffect(() => {
@@ -89,7 +89,35 @@ export function UpdateReviewModal({
     for (const d of all) next[d.key] = d.changed;
     setSelected(next);
     setAccountsExpanded(false);
+    setShowUnchanged(false);
   }, [preview]);
+
+  // Robust equality — normalize whitespace, treat null/undefined/"" as equal,
+  // and compare numbers numerically so 16 vs "16" doesn't count as a change.
+  function valuesEqual(a: any, b: any): boolean {
+    const norm = (v: any) => {
+      if (v == null) return "";
+      if (typeof v === "number") return String(v);
+      return String(v).trim().replace(/\s+/g, " ");
+    };
+    const na = norm(a);
+    const nb = norm(b);
+    if (na === nb) return true;
+    const fa = parseFloat(na);
+    const fb = parseFloat(nb);
+    if (!Number.isNaN(fa) && !Number.isNaN(fb) && fa === fb) return true;
+    return false;
+  }
+
+  // Recompute `changed` defensively so visually-identical rows are treated as unchanged
+  function isActuallyChanged(d: Diff): boolean {
+    return d.changed && !valuesEqual(d.currentValue, d.proposedValue);
+  }
+
+  function visibleDiffs(diffs: Diff[]): Diff[] {
+    if (showUnchanged) return diffs;
+    return diffs.filter(isActuallyChanged);
+  }
 
   const applyMutation = useMutation({
     mutationFn: async () => {
@@ -122,7 +150,12 @@ export function UpdateReviewModal({
 
   const changedCount = useMemo(() => {
     const all = [...(cr?.diffs || []), ...(bs?.diffs || [])];
-    return all.filter((d) => d.changed).length;
+    return all.filter(isActuallyChanged).length;
+  }, [cr, bs]);
+
+  const unchangedCount = useMemo(() => {
+    const all = [...(cr?.diffs || []), ...(bs?.diffs || [])];
+    return all.length - all.filter(isActuallyChanged).length;
   }, [cr, bs]);
 
   const selectedCount = useMemo(
@@ -187,17 +220,35 @@ export function UpdateReviewModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col p-0 gap-0">
-        <DialogHeader className="p-6 pb-4 border-b">
+      <DialogContent className="max-w-3xl h-[90vh] max-h-[90vh] flex flex-col p-0 gap-0 overflow-hidden">
+        <DialogHeader className="p-6 pb-4 border-b shrink-0">
           <DialogTitle>Review extracted data</DialogTitle>
           <DialogDescription>
             {changedCount > 0
               ? `${changedCount} field${changedCount === 1 ? "" : "s"} would change. Tick the ones you want to apply.`
               : "Nothing different was found. You can still re-apply any field if you want."}
           </DialogDescription>
+          {unchangedCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowUnchanged((s) => !s)}
+              className="mt-2 inline-flex items-center gap-1.5 self-start text-xs text-muted-foreground hover:text-foreground transition-colors"
+              data-testid="button-toggle-unchanged"
+            >
+              {showUnchanged ? (
+                <>
+                  <EyeOff className="h-3.5 w-3.5" /> Hide {unchangedCount} unchanged field{unchangedCount === 1 ? "" : "s"}
+                </>
+              ) : (
+                <>
+                  <Eye className="h-3.5 w-3.5" /> Show {unchangedCount} unchanged field{unchangedCount === 1 ? "" : "s"}
+                </>
+              )}
+            </button>
+          )}
         </DialogHeader>
 
-        <ScrollArea className="flex-1">
+        <div className="flex-1 min-h-0 overflow-y-auto">
           <div className="p-6 space-y-6">
             {preview?.errors && preview.errors.length > 0 && (
               <Alert variant="destructive">
@@ -247,11 +298,9 @@ export function UpdateReviewModal({
                 {cr.allAccounts && cr.allAccounts.length > 0 && (
                   <Collapsible open={accountsExpanded} onOpenChange={setAccountsExpanded}>
                     <CollapsibleTrigger asChild>
-                      <Button
+                      <button
                         type="button"
-                        variant="outline"
-                        size="sm"
-                        className="w-full justify-between text-xs"
+                        className="flex w-full items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-medium hover:bg-muted transition-colors"
                       >
                         <span>
                           Accounts Found: <strong>{cr.allAccounts.length}</strong> tradelines
@@ -261,7 +310,7 @@ export function UpdateReviewModal({
                             accountsExpanded ? "rotate-180" : ""
                           }`}
                         />
-                      </Button>
+                      </button>
                     </CollapsibleTrigger>
                     <CollapsibleContent className="mt-2">
                       <div className="rounded-md border bg-muted/20 max-h-60 overflow-auto">
@@ -300,7 +349,15 @@ export function UpdateReviewModal({
                   </Collapsible>
                 )}
 
-                <div className="space-y-2">{cr.diffs.map(renderDiffRow)}</div>
+                <div className="space-y-2">
+                  {visibleDiffs(cr.diffs).length === 0 ? (
+                    <div className="text-center py-6 text-xs text-muted-foreground rounded-md border border-dashed border-border">
+                      No credit-report fields changed.
+                    </div>
+                  ) : (
+                    visibleDiffs(cr.diffs).map(renderDiffRow)
+                  )}
+                </div>
               </section>
             )}
 
@@ -362,7 +419,15 @@ export function UpdateReviewModal({
                   </div>
                 </div>
 
-                <div className="space-y-2">{bs.diffs.map(renderDiffRow)}</div>
+                <div className="space-y-2">
+                  {visibleDiffs(bs.diffs).length === 0 ? (
+                    <div className="text-center py-6 text-xs text-muted-foreground rounded-md border border-dashed border-border">
+                      No bank-statement fields changed.
+                    </div>
+                  ) : (
+                    visibleDiffs(bs.diffs).map(renderDiffRow)
+                  )}
+                </div>
               </section>
             )}
 
@@ -373,11 +438,11 @@ export function UpdateReviewModal({
               </div>
             )}
           </div>
-        </ScrollArea>
+        </div>
 
-        <DialogFooter className="p-4 border-t bg-muted/20 flex flex-row items-center justify-between sm:justify-between gap-3">
+        <DialogFooter className="p-4 border-t bg-muted/20 flex flex-row items-center justify-between sm:justify-between gap-3 shrink-0">
           <span className="text-xs text-muted-foreground">
-            {selectedCount} of {(cr?.diffs.length || 0) + (bs?.diffs.length || 0)} selected
+            {selectedCount} of {changedCount + (showUnchanged ? unchangedCount : 0)} selected
           </span>
           <div className="flex gap-2">
             <Button variant="outline" onClick={() => onOpenChange(false)}>
