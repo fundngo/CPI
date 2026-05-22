@@ -19,6 +19,7 @@ import {
 import {
   ArrowLeft,
   FileDown,
+  Pencil,
   Trash2,
   Phone,
   Mail,
@@ -143,6 +144,15 @@ export default function ClientProfile() {
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant="outline"
+            className="gap-2"
+            onClick={() => setLocation(`/clients/${id}/edit`)}
+            data-testid="button-edit-client"
+          >
+            <Pencil className="h-4 w-4" />
+            Edit
+          </Button>
           <Button
             variant="outline"
             className="gap-2"
@@ -396,7 +406,7 @@ export default function ClientProfile() {
         </SectionCard>
 
         <div className="text-center text-xs text-white/50 pt-4">
-          To update this client, delete and re-upload a fresh credit report.
+          Use Edit to update client info, or delete and re-upload a fresh credit report.
         </div>
       </div>
       </div>

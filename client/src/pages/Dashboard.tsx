@@ -84,32 +84,34 @@ export default function Dashboard() {
         />
       </div>
 
-      <Card className="border-card-border shadow-lg rounded-xl overflow-hidden">
-        <div className="p-4 flex flex-col sm:flex-row gap-3 border-b border-card-border">
-          <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              data-testid="input-search-clients"
-              placeholder="Search clients by name, email, or phone…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="pl-9 bg-white border-slate-200 text-card-foreground"
-            />
-          </div>
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-full sm:w-48" data-testid="select-status-filter">
-              <SelectValue placeholder="All statuses" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All statuses</SelectItem>
-              {CLIENT_STATUSES.map((s) => (
-                <SelectItem key={s} value={s}>
-                  {s}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+      {/* Prominent search bar */}
+      <div className="mb-5 flex flex-col sm:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-white/50" />
+          <Input
+            data-testid="input-search-clients"
+            placeholder="Search clients by name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="pl-12 h-12 text-base bg-white border-white/10 text-card-foreground rounded-xl shadow-lg focus-visible:ring-2 focus-visible:ring-accent"
+          />
         </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="w-full sm:w-56 h-12 bg-white rounded-xl shadow-lg" data-testid="select-status-filter">
+            <SelectValue placeholder="All statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            {CLIENT_STATUSES.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <Card className="border-card-border shadow-lg rounded-xl overflow-hidden">
 
         <div className="overflow-x-auto">
           <table className="w-full">

@@ -70,6 +70,43 @@ export function utilizationColor(utilPct: number): string {
   return "hsl(0 72% 51%)"; // red
 }
 
+// ---- CPI Sheet helpers (color buckets + paydown targets) ----
+export type UtilBucket = "green" | "yellow" | "red";
+
+/** Bucket utilization using the user's CPI thresholds (≤15 / ≤30 / >30). */
+export function utilBucket(utilPct: number): UtilBucket {
+  if (utilPct <= 15) return "green";
+  if (utilPct <= 30) return "yellow";
+  return "red";
+}
+
+/** Tailwind-style RGB hex for each bucket (used by both DOM and PDF). */
+export function bucketHex(bucket: UtilBucket): string {
+  if (bucket === "green") return "#16a34a"; // green-600
+  if (bucket === "yellow") return "#d97706"; // amber-600
+  return "#dc2626"; // red-600
+}
+
+/** Light tint hex for row backgrounds. */
+export function bucketTintHex(bucket: UtilBucket): string {
+  if (bucket === "green") return "#ecfdf5"; // emerald-50
+  if (bucket === "yellow") return "#fffbeb"; // amber-50
+  return "#fef2f2"; // red-50
+}
+
+/** Max balance to be at or under {pct}% of limit. */
+export function targetBalanceAt(creditLimit: number, pct: number): number {
+  const lim = Math.max(0, creditLimit || 0);
+  return Math.round((lim * pct) / 100);
+}
+
+/** $ that must be paid down to get to {pct}%. 0 if already at/under. */
+export function paydownTo(currentBalance: number, creditLimit: number, pct: number): number {
+  const target = targetBalanceAt(creditLimit, pct);
+  const owed = Math.max(0, (currentBalance || 0) - target);
+  return Math.round(owed);
+}
+
 export function businessRevenueScore(monthly: number): number {
   if (monthly >= 50000) return 100;
   if (monthly >= 20000) return 85;

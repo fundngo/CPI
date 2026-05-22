@@ -9,6 +9,7 @@ import Dashboard from "@/pages/Dashboard";
 import AddClient from "@/pages/AddClient";
 import AddClientManual from "@/pages/AddClientManual";
 import ClientProfile from "@/pages/ClientProfile";
+import EditClient from "@/pages/EditClient";
 import Settings from "@/pages/Settings";
 import { AppLayout } from "@/components/AppLayout";
 
@@ -19,6 +20,7 @@ function AppRouter() {
         <Route path="/" component={Dashboard} />
         <Route path="/clients/new" component={AddClient} />
         <Route path="/clients/new/manual" component={AddClientManual} />
+        <Route path="/clients/:id/edit" component={EditClient} />
         <Route path="/clients/:id" component={ClientProfile} />
         <Route path="/settings" component={Settings} />
         <Route component={NotFound} />

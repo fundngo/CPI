@@ -11,12 +11,31 @@ import {
   fundingReadinessScore,
   overallUtilization,
   parseMissingDocs,
+  paydownTo,
   personalBankingStrength,
   readinessLabel,
+  targetBalanceAt,
   totalBalance,
   totalCreditLimit,
+  utilBucket,
   utilizationStatus,
 } from "./calculations";
+
+// Hex → [r,g,b] for jsPDF (which only accepts numeric color triples).
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace("#", "");
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+const BUCKET_TEXT: Record<"green" | "yellow" | "red", [number, number, number]> = {
+  green: hexToRgb("#16a34a"),
+  yellow: hexToRgb("#d97706"),
+  red: hexToRgb("#dc2626"),
+};
+const BUCKET_TINT: Record<"green" | "yellow" | "red", [number, number, number]> = {
+  green: hexToRgb("#ecfdf5"),
+  yellow: hexToRgb("#fffbeb"),
+  red: hexToRgb("#fef2f2"),
+};
 
 export function generateClientPdf(client: ClientWithDetails) {
   const doc = new jsPDF({ unit: "pt", format: "letter" });
@@ -197,50 +216,143 @@ export function generateClientPdf(client: ClientWithDetails) {
   y += 4;
 
   if (client.creditCards.length) {
-    ensure(24);
-    // Column layout (pt), tuned so issuer text doesn't collide with limit:
-    // CARD: margin .. margin+140 (left)
-    // ISSUER: margin+150 .. margin+260 (left)
-    // LIMIT: right-aligned at margin+320
-    // BALANCE: right-aligned at margin+380
-    // UTIL: right-aligned at margin+420
-    // STATUS: left at margin+440
-    const cardCol = margin;
-    const issuerCol = margin + 150;
-    const issuerMaxW = 100; // 150..250 area; right edge ~260 before LIMIT right-aligns at 320
-    const limitCol = margin + 320;
-    const balanceCol = margin + 380;
-    const utilCol = margin + 425;
-    const statusCol = margin + 445;
-
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(9);
+    // Color-code legend
+    ensure(16);
+    doc.setFontSize(8);
+    doc.setFont("helvetica", "normal");
     doc.setTextColor(...slate);
-    doc.text("CARD", cardCol, y);
-    doc.text("ISSUER", issuerCol, y);
-    doc.text("LIMIT", limitCol, y, { align: "right" });
-    doc.text("BALANCE", balanceCol, y, { align: "right" });
-    doc.text("UTIL", utilCol, y, { align: "right" });
-    doc.text("STATUS", statusCol, y);
-    y += 6;
+    const legendY = y;
+    function legendDot(x: number, label: string, fill: [number, number, number]) {
+      doc.setFillColor(...fill);
+      doc.circle(x + 3, legendY - 2.5, 2.5, "F");
+      doc.text(label, x + 9, legendY);
+    }
+    legendDot(margin, "≤ 15% Good", BUCKET_TEXT.green);
+    legendDot(margin + 110, "15.01–30% Watch", BUCKET_TEXT.yellow);
+    legendDot(margin + 240, "> 30% Over target", BUCKET_TEXT.red);
+    y += 14;
+
+    ensure(36);
+    // 9-column layout for CPI sheet (page usable width 516pt with 48pt margins):
+    // CARD (left)        : margin .. margin+92
+    // ISSUER (left)      : margin+98 .. margin+178
+    // LIMIT (right)      : margin+236
+    // BALANCE (right)    : margin+296
+    // UTIL (right)       : margin+340
+    // TARGET 30 (right)  : margin+390
+    // TARGET 15 (right)  : margin+440
+    // PAYDOWN 30 (right) : margin+498
+    // STATUS dropped to keep things readable in PDF (still in app)
+    const colCard = margin;
+    const colIssuer = margin + 98;
+    const colLimit = margin + 236;
+    const colBalance = margin + 296;
+    const colUtil = margin + 340;
+    const colT30 = margin + 390;
+    const colT15 = margin + 440;
+    const colPay = margin + 498;
+
+    // Header row
+    doc.setFillColor(...muted);
+    doc.rect(margin, y - 10, W - margin * 2, 18, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(...slate);
+    doc.text("CARD", colCard, y);
+    doc.text("ISSUER", colIssuer, y);
+    doc.text("LIMIT", colLimit, y, { align: "right" });
+    doc.text("BAL", colBalance, y, { align: "right" });
+    doc.text("UTIL", colUtil, y, { align: "right" });
+    doc.text("TGT 30%", colT30, y, { align: "right" });
+    doc.text("TGT 15%", colT15, y, { align: "right" });
+    doc.text("PAYDOWN", colPay, y, { align: "right" });
+    y += 8;
     doc.setDrawColor(220, 224, 232);
     doc.line(margin, y, W - margin, y);
     y += 12;
+
     doc.setFont("helvetica", "normal");
-    doc.setFontSize(10);
-    doc.setTextColor(40, 50, 70);
+    doc.setFontSize(9);
+    let totLimit = 0;
+    let totBal = 0;
+    let totT30 = 0;
+    let totT15 = 0;
+    let totPay30 = 0;
     for (const card of client.creditCards) {
       ensure(16);
-      const cardName = doc.splitTextToSize(card.cardName || "—", 140);
-      const issuer = doc.splitTextToSize(card.issuer || "—", issuerMaxW);
-      doc.text(cardName[0], cardCol, y);
-      doc.text(issuer[0], issuerCol, y);
-      doc.text(fmtCurrency(card.creditLimit), limitCol, y, { align: "right" });
-      doc.text(fmtCurrency(card.currentBalance), balanceCol, y, { align: "right" });
-      doc.text(`${cardUtilization(card).toFixed(0)}%`, utilCol, y, { align: "right" });
-      doc.text(card.accountStatus, statusCol, y);
-      y += 14;
+      const util = cardUtilization(card);
+      const bucket = utilBucket(util);
+      const t30 = targetBalanceAt(card.creditLimit, 30);
+      const t15 = targetBalanceAt(card.creditLimit, 15);
+      const p30 = paydownTo(card.currentBalance, card.creditLimit, 30);
+
+      // tinted row background + colored left bar
+      doc.setFillColor(...BUCKET_TINT[bucket]);
+      doc.rect(margin, y - 10, W - margin * 2, 16, "F");
+      doc.setFillColor(...BUCKET_TEXT[bucket]);
+      doc.rect(margin, y - 10, 3, 16, "F");
+
+      doc.setTextColor(40, 50, 70);
+      const cardName = doc.splitTextToSize(card.cardName || "—", 86);
+      const issuer = doc.splitTextToSize(card.issuer || "—", 130);
+      doc.text(cardName[0], colCard + 5, y);
+      doc.text(issuer[0], colIssuer, y);
+      doc.text(fmtCurrency(card.creditLimit), colLimit, y, { align: "right" });
+      doc.text(fmtCurrency(card.currentBalance), colBalance, y, { align: "right" });
+
+      // util in bucket color, bold
+      doc.setTextColor(...BUCKET_TEXT[bucket]);
+      doc.setFont("helvetica", "bold");
+      doc.text(`${util.toFixed(0)}%`, colUtil, y, { align: "right" });
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(40, 50, 70);
+
+      doc.text(fmtCurrency(t30), colT30, y, { align: "right" });
+      doc.text(fmtCurrency(t15), colT15, y, { align: "right" });
+
+      if (p30 > 0) {
+        doc.setTextColor(...BUCKET_TEXT[bucket]);
+        doc.setFont("helvetica", "bold");
+        doc.text(fmtCurrency(p30), colPay, y, { align: "right" });
+        doc.setFont("helvetica", "normal");
+        doc.setTextColor(40, 50, 70);
+      } else {
+        doc.setTextColor(...BUCKET_TEXT.green);
+        doc.text("On target", colPay, y, { align: "right" });
+        doc.setTextColor(40, 50, 70);
+      }
+
+      totLimit += card.creditLimit || 0;
+      totBal += card.currentBalance || 0;
+      totT30 += t30;
+      totT15 += t15;
+      totPay30 += p30;
+      y += 16;
     }
+
+    // Totals row
+    ensure(18);
+    doc.setFillColor(...muted);
+    doc.rect(margin, y - 10, W - margin * 2, 18, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(...navy);
+    doc.text("TOTALS", colCard + 5, y);
+    doc.text(fmtCurrency(totLimit), colLimit, y, { align: "right" });
+    doc.text(fmtCurrency(totBal), colBalance, y, { align: "right" });
+    doc.text(`${overallUtilization(client.creditCards).toFixed(1)}%`, colUtil, y, { align: "right" });
+    doc.text(fmtCurrency(totT30), colT30, y, { align: "right" });
+    doc.text(fmtCurrency(totT15), colT15, y, { align: "right" });
+    if (totPay30 > 0) {
+      doc.setTextColor(...BUCKET_TEXT.red);
+      doc.text(fmtCurrency(totPay30), colPay, y, { align: "right" });
+    } else {
+      doc.setTextColor(...BUCKET_TEXT.green);
+      doc.text("On target", colPay, y, { align: "right" });
+    }
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(40, 50, 70);
+    y += 18;
   }
   y += 8;
 
