@@ -1,5 +1,6 @@
 import jsPDF from "jspdf";
 import type { ClientWithDetails } from "@shared/schema";
+import logoUrl from "@/assets/fund-go-logo.png";
 import {
   autoRecommendedSteps,
   businessBankingStrength,
@@ -56,17 +57,22 @@ export function generateClientPdf(client: ClientWithDetails) {
     }
   }
 
-  // Brand header
+  // Brand header with logo
   doc.setFillColor(...navy);
   doc.rect(0, 0, W, 72, "F");
   doc.setTextColor(255, 255, 255);
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(16);
-  doc.text("Get You Right Consulting", margin, 32);
+  // Logo (PNG) — aspect-preserved height ~40pt, left-aligned in header
+  try {
+    doc.addImage(logoUrl, "PNG", margin, 16, 160, 40, undefined, "FAST");
+  } catch {
+    // Fallback to text if image fails
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.text("Get You Right Consulting", margin, 32);
+  }
   doc.setFont("helvetica", "normal");
-  doc.setFontSize(10);
-  doc.text("Client Profile Intake — Confidential", margin, 50);
   doc.setFontSize(9);
+  doc.text("Client Profile Intake — Confidential", W - margin, 32, { align: "right" });
   doc.text(`Generated ${new Date().toLocaleDateString()}`, W - margin, 50, { align: "right" });
 
   y = 96;
@@ -160,10 +166,12 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.setFontSize(12);
     doc.setTextColor(...navy);
     doc.text(title, margin, y);
+    // Underline spans the full width of the title text
+    const titleWidth = doc.getTextWidth(title);
     y += 6;
     doc.setDrawColor(...emerald);
     doc.setLineWidth(2);
-    doc.line(margin, y, margin + 40, y);
+    doc.line(margin, y, margin + titleWidth, y);
     doc.setLineWidth(1);
     y += 14;
     doc.setTextColor(...slate);
@@ -216,8 +224,9 @@ export function generateClientPdf(client: ClientWithDetails) {
   y += 4;
 
   if (client.creditCards.length) {
-    // Color-code legend
-    ensure(16);
+    // Color-code legend (ASCII only — helvetica WinAnsi mangles ≤ and –)
+    y += 6;
+    ensure(20);
     doc.setFontSize(8);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(...slate);
@@ -227,10 +236,10 @@ export function generateClientPdf(client: ClientWithDetails) {
       doc.circle(x + 3, legendY - 2.5, 2.5, "F");
       doc.text(label, x + 9, legendY);
     }
-    legendDot(margin, "≤ 15% Good", BUCKET_TEXT.green);
-    legendDot(margin + 110, "15.01–30% Watch", BUCKET_TEXT.yellow);
-    legendDot(margin + 240, "> 30% Over target", BUCKET_TEXT.red);
-    y += 14;
+    legendDot(margin, "Under 15% - Good", BUCKET_TEXT.green);
+    legendDot(margin + 130, "15-30% - Watch", BUCKET_TEXT.yellow);
+    legendDot(margin + 250, "Over 30% - Over target", BUCKET_TEXT.red);
+    y += 16;
 
     ensure(36);
     // 9-column layout for CPI sheet (page usable width 516pt with 48pt margins):
@@ -293,10 +302,21 @@ export function generateClientPdf(client: ClientWithDetails) {
       doc.rect(margin, y - 10, 3, 16, "F");
 
       doc.setTextColor(40, 50, 70);
-      const cardName = doc.splitTextToSize(card.cardName || "—", 86);
-      const issuer = doc.splitTextToSize(card.issuer || "—", 130);
-      doc.text(cardName[0], colCard + 5, y);
-      doc.text(issuer[0], colIssuer, y);
+      // Hard-truncate to fit columns — issuer must not overflow into the
+      // right-aligned LIMIT column. Available width for issuer ~ 110pt with
+      // an 8pt safety gap before the LIMIT figure starts.
+      function truncateToWidth(text: string, maxW: number): string {
+        let s = text;
+        if (doc.getTextWidth(s) <= maxW) return s;
+        while (s.length > 1 && doc.getTextWidth(s + "\u2026") > maxW) {
+          s = s.slice(0, -1);
+        }
+        return s + "\u2026";
+      }
+      const cardNameText = truncateToWidth(card.cardName || "—", 88);
+      const issuerText = truncateToWidth(card.issuer || "—", 110);
+      doc.text(cardNameText, colCard + 5, y);
+      doc.text(issuerText, colIssuer, y);
       doc.text(fmtCurrency(card.creditLimit), colLimit, y, { align: "right" });
       doc.text(fmtCurrency(card.currentBalance), colBalance, y, { align: "right" });
 
