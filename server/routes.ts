@@ -25,6 +25,29 @@ export async function registerRoutes(
 
   // ====== Shared helpers for PDF extraction ======
 
+  // Detect encoded/garbled PDF text. Funding Suite credit reports and other
+  // PDFs with custom CID-encoded fonts produce text where pdf-parse returns
+  // glyph-index codepoints, not real letters. If we fed that to the LLM it
+  // would hallucinate plausible-but-wrong tradelines. Bail out instead.
+  function looksGarbled(text: string): boolean {
+    if (!text) return true;
+    const sample = text.slice(0, 8000);
+    const total = sample.length;
+    if (total < 200) return false;
+    let asciiLetter = 0;
+    let weird = 0;
+    for (let i = 0; i < total; i++) {
+      const c = sample.charCodeAt(i);
+      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) asciiLetter++;
+      else if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) weird++;
+      else if (c >= 0x80 && c <= 0x9f) weird++;
+      else if (c >= 0xe000 && c <= 0xf8ff) weird++;
+    }
+    const letterRatio = asciiLetter / total;
+    const weirdRatio = weird / total;
+    return letterRatio < 0.20 || weirdRatio > 0.15;
+  }
+
   async function extractPdfText(base64: string): Promise<{ text?: string; error?: string }> {
     const cleaned = base64.includes(",") ? base64.split(",")[1] : base64;
     try {
@@ -40,6 +63,9 @@ export async function registerRoutes(
       await parser.destroy?.();
       if (!pdfText || pdfText.length < 50) {
         return { error: "This PDF has no readable text. It may be a scanned image — please try a text-based PDF or enter manually." };
+      }
+      if (looksGarbled(pdfText)) {
+        return { error: "This PDF uses encoded fonts that can't be read as text (common in Funding Suite mortgage reports and some MyFICO exports). Please enter the data manually or upload a different PDF export." };
       }
       const MAX_TEXT = 180000;
       if (pdfText.length > MAX_TEXT) pdfText = pdfText.slice(0, MAX_TEXT);
