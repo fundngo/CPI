@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation, useRoute } from "wouter";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { CreditAnalysisView } from "@/components/CreditAnalysisView";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -23,6 +24,8 @@ import {
   Trash2,
   Phone,
   Mail,
+  MapPin,
+  Plus,
   Calendar,
   User,
   Building2,
@@ -122,19 +125,35 @@ export default function ClientProfile() {
             </h1>
             <StatusBadge status={client.status as ClientStatus} />
           </div>
-          {client.address && (
-            <div className="mt-1.5 text-sm text-white/70" data-testid="text-client-address">
-              {client.address}
-            </div>
-          )}
+          <div className="mt-1.5" data-testid="text-client-address">
+            <InlineField
+              icon={<MapPin className="h-3.5 w-3.5" />}
+              value={client.address || ""}
+              placeholder="Add address"
+              field="address"
+              clientId={id}
+            />
+          </div>
           <div className="flex items-center gap-4 mt-2 text-sm text-white/70 flex-wrap">
-            <span className="flex items-center gap-1.5" data-testid="text-client-phone">
-              <Phone className="h-3.5 w-3.5" />
-              {client.phone || "—"}
+            <span data-testid="text-client-phone">
+              <InlineField
+                icon={<Phone className="h-3.5 w-3.5" />}
+                value={client.phone || ""}
+                placeholder="Add phone"
+                field="phone"
+                type="tel"
+                clientId={id}
+              />
             </span>
-            <span className="flex items-center gap-1.5" data-testid="text-client-email">
-              <Mail className="h-3.5 w-3.5" />
-              {client.email || "—"}
+            <span data-testid="text-client-email">
+              <InlineField
+                icon={<Mail className="h-3.5 w-3.5" />}
+                value={client.email || ""}
+                placeholder="Add email"
+                field="email"
+                type="email"
+                clientId={id}
+              />
             </span>
             <span className="flex items-center gap-1.5">
               <Calendar className="h-3.5 w-3.5" />
@@ -479,5 +498,115 @@ function QuickStatCard({ label, value }: { label: string; value: string }) {
         <div className="text-2xl font-bold tabular-nums mt-1 text-card-foreground">{value}</div>
       </div>
     </Card>
+  );
+}
+
+/**
+ * Click-to-edit inline field for the client header (address / phone / email).
+ * Shows a subtle "Add ..." placeholder when empty, becomes an input on click,
+ * saves on Enter or blur, cancels on Escape.
+ */
+function InlineField({
+  icon,
+  value,
+  placeholder,
+  field,
+  clientId,
+  type = "text",
+}: {
+  icon: React.ReactNode;
+  value: string;
+  placeholder: string;
+  field: "address" | "phone" | "email";
+  clientId: number;
+  type?: string;
+}) {
+  const { toast } = useToast();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  const saveMutation = useMutation({
+    mutationFn: async (next: string) =>
+      apiRequest("PATCH", `/api/clients/${clientId}`, { [field]: next }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/clients", clientId] });
+      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+      setEditing(false);
+    },
+    onError: (e: Error) => {
+      toast({ title: "Save failed", description: e.message, variant: "destructive" });
+      setDraft(value);
+      setEditing(false);
+    },
+  });
+
+  const commit = () => {
+    const next = draft.trim();
+    if (next === value.trim()) {
+      setEditing(false);
+      return;
+    }
+    saveMutation.mutate(next);
+  };
+
+  if (editing) {
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <span className="text-white/70">{icon}</span>
+        <Input
+          ref={inputRef}
+          type={type}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") {
+              setDraft(value);
+              setEditing(false);
+            }
+          }}
+          placeholder={placeholder}
+          className="h-7 px-2 py-0 text-sm bg-white/10 border-white/20 text-white placeholder:text-white/40 w-[220px]"
+          data-testid={`input-inline-${field}`}
+        />
+      </span>
+    );
+  }
+
+  const isEmpty = !value || value.trim() === "";
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      className={
+        "inline-flex items-center gap-1.5 text-sm rounded px-1.5 py-0.5 -mx-1.5 transition-colors hover:bg-white/10 " +
+        (isEmpty ? "text-white/40 hover:text-white/80" : "text-white/80 hover:text-white")
+      }
+      data-testid={`button-inline-edit-${field}`}
+      title={isEmpty ? `Click to ${placeholder.toLowerCase()}` : "Click to edit"}
+    >
+      <span>{icon}</span>
+      {isEmpty ? (
+        <span className="inline-flex items-center gap-1">
+          <Plus className="h-3 w-3" />
+          {placeholder}
+        </span>
+      ) : (
+        <span>{value}</span>
+      )}
+    </button>
   );
 }
