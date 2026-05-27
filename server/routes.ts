@@ -125,8 +125,8 @@ export async function registerRoutes(
 
   const CREDIT_REPORT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
 {
-  "name": string,
-  "address": string,
+  "name": string,    // see CRITICAL NAME/ADDRESS RULES below
+  "address": string, // see CRITICAL NAME/ADDRESS RULES below
   "phone": string|null,
   "email": string|null,
   "creditScore": number|null,
@@ -159,6 +159,14 @@ Also include a comprehensive flat list named allAccounts containing EVERY tradel
   { "creditor": string, "accountType": "Credit Card"|"Auto Loan"|"Mortgage"|"Student Loan"|"Personal Loan"|"Collection"|"Charge-Off"|"Repossession"|"Public Record"|"Other", "status": "Open"|"Closed"|"Paid"|"Current"|"Past Due"|"Charged Off"|"In Collection"|string, "openedYear": number|null, "balance": number|null }
 ]
 
+CRITICAL NAME/ADDRESS RULES:
+- Pull "name" and "address" ONLY from the consumer's Personal Information / Personal Profile / Consumer Information / Personal Identifying Information / Consumer Statement section at the top of the report — the section that lists the real consumer's full name, partial DOB, address history, and masked SSN.
+- For "address", use the address marked Current, Primary, or Most Recent. If multiple addresses are listed, pick the one with the most recent reported / on-file date. Format as "STREET, CITY ST ZIP".
+- IGNORE all placeholder, sample, instructional, or merge-template text. Specifically, NEVER use any of these values: FOLLOW ME, FOLLOW ME LATER, SAMPLE, EXAMPLE, TEST, JOHN DOE, JANE DOE, John A. Sample, JOHN Q PUBLIC, JANE SMITH (when on a template), SOMEWHERE STREET, SOMEPLACE, ANYTOWN, ANYWHERE, 12345 (alone), 99999, 123 MAIN ST, 123 ANY STREET, YOUR NAME, YOUR ADDRESS, CLIENT NAME, [NAME], [ADDRESS], CONSUMER NAME, N/A, NONE.
+- NEVER pull the name or address from a dispute-letter template, sample letter, instructions panel, marketing footer, or any section showing how a future letter would look. Those sections often contain placeholder text like FOLLOW ME and SOMEWHERE STREET.
+- NEVER pull the name or address from a creditor's mailing block (e.g. an address shown next to ENHANCED RECOVERY, MIDLAND CREDIT, etc.) — those are creditor addresses, not the consumer's.
+- If the report has no recognizable consumer Personal Information section, OR the only candidates match the placeholders above, return EMPTY STRING ("") for that field rather than guessing.
+
 Extract from the attached credit report PDF. Dates use "YYYY-MM" format. lateHistory is a short summary like "1x60d 1x90d" or "24x90d" describing how many times late and severity. withinTwelveMonths is true if the most recent late payment occurred within the last 12 months from today. monthsSinceLate is the integer number of months between the most recent late date and today (use 0 if unknown). repossessions includes vehicle or asset repossessions — list each one. publicRecords includes bankruptcies, judgments, foreclosures, tax liens; recordType MUST be one of the listed values. For totalAccountsCount: count EVERY tradeline listed on the report — open AND closed/paid accounts, revolving + installment (auto, mortgage, student) + collections + charge-offs + public records. The value MUST equal allAccounts.length. List ALL accounts in their proper category arrays — credit cards (revolving) go in creditCards; auto loans, mortgages, student loans, personal loans go ONLY if they appear as charge-off/repossession/collection — but EVERY account regardless of type must appear in allAccounts. If a field is unknown, use null (or empty string for required strings, 0 for numbers, [] for arrays). For accountStatus, use "Current" by default. Return ONLY the JSON object.`;
 
   const BANK_STATEMENT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
@@ -185,6 +193,62 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
 
   // ====== Endpoints ======
 
+  // Server-side safety net: strip out known placeholder values that some
+  // credit-report templates contain (dispute-letter samples, instructional
+  // panels). If the LLM still grabbed one of these despite the prompt,
+  // blank it out so the user can fill it in via Edit instead of seeing junk.
+  const NAME_PLACEHOLDER_PATTERNS: RegExp[] = [
+    /\bfollow\s*me( later)?\b/i,
+    /\b(sample|example|test)\b/i,
+    /\bjohn\s+doe\b/i,
+    /\bjane\s+doe\b/i,
+    /\bjohn\s+q\.?\s+public\b/i,
+    /\byour\s+name\b/i,
+    /\bclient\s+name\b/i,
+    /\bconsumer\s+name\b/i,
+    /^\s*\[?(name|address)\]?\s*$/i,
+    /^\s*n\/?a\s*$/i,
+    /^\s*none\s*$/i,
+  ];
+  const ADDR_PLACEHOLDER_PATTERNS: RegExp[] = [
+    /\bsomewhere\s+(street|st|drive|dr|ave|avenue|road|rd)\b/i,
+    /\bsomeplace\b/i,
+    /\banytown\b/i,
+    /\banywhere\b/i,
+    /\byour\s+address\b/i,
+    /\b123\s+main\s+st(reet)?\b/i,
+    /\b123\s+any\s+(street|st)\b/i,
+    /^\s*\[?address\]?\s*$/i,
+    /\b12345\b.*\b(somewhere|someplace|anytown|anywhere)\b/i,
+    /^\s*n\/?a\s*$/i,
+  ];
+  function sanitizePlaceholder(value: string | null | undefined, patterns: RegExp[]): string {
+    if (!value) return "";
+    const v = String(value).trim();
+    if (!v) return "";
+    for (const p of patterns) if (p.test(v)) return "";
+    return v;
+  }
+
+  // Best-effort: derive a real name from the uploaded PDF's filename when
+  // the LLM gave us a placeholder. We use the consultant's own naming
+  // convention: "<First Last> - CR (MM-DD-YY).pdf" or "<First Last> CR ...".
+  function deriveNameFromFilename(fileName?: string): string {
+    if (!fileName) return "";
+    let base = fileName.replace(/\.[a-zA-Z0-9]+$/, ""); // strip extension
+    // Strip anything from " - CR" / " CR " / parens onward
+    base = base.split(/\s+-\s+CR\b|\s+CR\b|\(/i)[0];
+    base = base.replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
+    // Must look like a person's name: 2-4 words, alpha-only
+    if (!/^[A-Za-z][A-Za-z.'\- ]{2,60}$/.test(base)) return "";
+    const parts = base.split(" ").filter(Boolean);
+    if (parts.length < 2 || parts.length > 4) return "";
+    // Title-case each part
+    return parts
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(" ");
+  }
+
   // Extract client data from a credit-report PDF (used by Add Client flow)
   app.post("/api/extract-credit-report", async (req: Request, res: Response) => {
     try {
@@ -196,6 +260,13 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
         CREDIT_REPORT_SCHEMA_PROMPT,
         `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`
       );
+      // Strip known placeholders
+      const cleanName = sanitizePlaceholder(parsed?.name, NAME_PLACEHOLDER_PATTERNS);
+      const cleanAddress = sanitizePlaceholder(parsed?.address, ADDR_PLACEHOLDER_PATTERNS);
+      // If name came back empty after stripping, try to derive from filename
+      const fallbackName = cleanName || deriveNameFromFilename(fileName);
+      parsed.name = fallbackName;
+      parsed.address = cleanAddress;
       res.json({ extracted: parsed, fileName: fileName || "credit-report.pdf" });
     } catch (e: any) {
       console.error("Extract error:", e);
