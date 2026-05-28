@@ -16,10 +16,23 @@ async function loadPdfjs(): Promise<any> {
       // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
       const dynImport: (s: string) => Promise<any> = new Function("s", "return import(s)") as any;
       const mod = await dynImport("pdfjs-dist/legacy/build/pdf.mjs");
-      // pdfjs expects workerSrc to be a string. We're running server-side so
-      // we don't actually want a worker, but setting it to false trips an
-      // 'Invalid `workerSrc` type' assertion. Leave it as the default empty
-      // string — pdfjs will run on the main thread (fine for our small PDFs).
+      // pdfjs v5 will otherwise try to fetch a worker from a CDN that may not
+      // match the installed API version (we hit "API 5.6.205 vs Worker 5.4.296").
+      // Point workerSrc at the worker file shipped inside the SAME package so
+      // versions are guaranteed to match. We resolve via require.resolve so it
+      // works regardless of cwd.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const path = require("node:path");
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { pathToFileURL } = require("node:url");
+        const workerPath = require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+        if (mod?.GlobalWorkerOptions) {
+          mod.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
+        }
+      } catch (e) {
+        console.error("[pdfVision] could not resolve pdf.worker.mjs:", e);
+      }
       return mod;
     })();
   }
@@ -43,6 +56,8 @@ export async function renderPdfToPngs(
     disableFontFace: true,
     isEvalSupported: false,
     useSystemFonts: false,
+    // Run on the main thread — no separate worker. Avoids version-skew bugs.
+    disableWorker: true,
   });
   const pdf = await loadingTask.promise;
 
