@@ -4,15 +4,23 @@
 // because we render visually and let the vision model read the images.
 
 import { createCanvas } from "@napi-rs/canvas";
-// pdfjs-dist v5 ships an ESM entry; we use the legacy build for stable Node API.
-// @ts-ignore - pdfjs has no types for the legacy path
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
-// Disable the worker (we're running server-side, no need for worker threads)
-// @ts-ignore
-if (pdfjsLib.GlobalWorkerOptions) {
-  // @ts-ignore
-  pdfjsLib.GlobalWorkerOptions.workerSrc = false;
+// pdfjs-dist v5 is ESM-only. esbuild bundles us into CJS, so a static
+// `import` would get rewritten to require() and crash at runtime with
+// ERR_REQUIRE_ESM. Use a real dynamic import() — esbuild leaves these
+// alone in CJS output, so Node can load the ESM module at runtime.
+let pdfjsLibPromise: Promise<any> | null = null;
+async function loadPdfjs(): Promise<any> {
+  if (!pdfjsLibPromise) {
+    pdfjsLibPromise = (async () => {
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      const dynImport: (s: string) => Promise<any> = new Function("s", "return import(s)") as any;
+      const mod = await dynImport("pdfjs-dist/legacy/build/pdf.mjs");
+      if (mod?.GlobalWorkerOptions) mod.GlobalWorkerOptions.workerSrc = false;
+      return mod;
+    })();
+  }
+  return pdfjsLibPromise;
 }
 
 export type PdfPagePng = { pageNumber: number; base64Png: string; bytes: number };
@@ -24,6 +32,7 @@ export async function renderPdfToPngs(
   const cleaned = pdfBase64.includes(",") ? pdfBase64.split(",")[1] : pdfBase64;
   const data = new Uint8Array(Buffer.from(cleaned, "base64"));
 
+  const pdfjsLib = await loadPdfjs();
   const loadingTask = (pdfjsLib as any).getDocument({
     data,
     // Don't try to load standard fonts from disk — credit reports rarely need them

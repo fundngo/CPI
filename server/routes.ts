@@ -210,17 +210,25 @@ export async function registerRoutes(
       return { parsed, method: "text" };
     }
     // Text path failed (image-only, encoded fonts, or unreadable). Try vision.
+    console.log(`[extractFromPdf] text path failed (${error || "no text"}), falling back to vision`);
     let pages;
     try {
       pages = await renderPdfToPngs(base64, { maxPages: 12, scale: 1.5 });
     } catch (e: any) {
-      throw new Error(error || `Could not render PDF: ${e?.message || "unknown error"}`);
+      console.error("[extractFromPdf] PDF render failed:", e);
+      throw new Error(`Vision fallback failed to render PDF: ${e?.message || "unknown error"}. Original text error: ${error || "none"}`);
     }
     if (!pages.length) {
-      throw new Error(error || "PDF has no pages to read");
+      throw new Error("PDF has no pages to read (vision fallback)");
     }
-    const parsed = await claudeJsonFromImages(systemPrompt, visionInstruction, pages);
-    return { parsed, method: "vision" };
+    console.log(`[extractFromPdf] rendered ${pages.length} page(s) for vision extraction`);
+    try {
+      const parsed = await claudeJsonFromImages(systemPrompt, visionInstruction, pages);
+      return { parsed, method: "vision" };
+    } catch (e: any) {
+      console.error("[extractFromPdf] Vision Claude call failed:", e);
+      throw new Error(`Vision extraction failed: ${e?.message || "unknown error"}`);
+    }
   }
 
   const CREDIT_REPORT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
