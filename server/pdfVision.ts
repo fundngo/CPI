@@ -16,7 +16,10 @@ async function loadPdfjs(): Promise<any> {
       // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
       const dynImport: (s: string) => Promise<any> = new Function("s", "return import(s)") as any;
       const mod = await dynImport("pdfjs-dist/legacy/build/pdf.mjs");
-      if (mod?.GlobalWorkerOptions) mod.GlobalWorkerOptions.workerSrc = false;
+      // pdfjs expects workerSrc to be a string. We're running server-side so
+      // we don't actually want a worker, but setting it to false trips an
+      // 'Invalid `workerSrc` type' assertion. Leave it as the default empty
+      // string — pdfjs will run on the main thread (fine for our small PDFs).
       return mod;
     })();
   }
