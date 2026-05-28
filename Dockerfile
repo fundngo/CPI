@@ -29,13 +29,13 @@ ENV NODE_ENV=production \
     PORT=5000 \
     DATABASE_PATH=/data/data.db
 
-# Runtime libs only (no compilers needed).
-# libfontconfig1 + libpixman are needed by @napi-rs/canvas (vision PDF rendering).
+# Runtime libs.
+# poppler-utils ships `pdftoppm`, which we shell out to for vision PDF rendering
+# (handles Funding Suite / MyFICO CID-encoded fonts that pdfjs+canvas choke on).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libfontconfig1 \
-    libpixman-1-0 \
+    poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # Bring over the production node_modules (includes better-sqlite3 native build)
