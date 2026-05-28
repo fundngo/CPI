@@ -237,8 +237,9 @@ export async function registerRoutes(
   "address": string, // see CRITICAL NAME/ADDRESS RULES below
   "phone": string|null,
   "email": string|null,
-  "creditScore": number|null,
-  "creditScoreSource": string|null,
+  "creditScore": number|null,        // see SCORE RULES below — pick the MIDDLE of the 3 bureau scores (mortgage-qualifying mid-score)
+  "creditScoreSource": string|null,   // which bureau the chosen score came from ("Equifax"|"Experian"|"TransUnion")
+  "bureauScores": { "equifax": number|null, "experian": number|null, "transunion": number|null },
   "creditCards": [
     { "cardName": string, "issuer": string, "creditLimit": number, "currentBalance": number, "minimumPayment": number|null, "paymentDueDate": string|null, "accountStatus": "Current"|"Past Due"|"Closed"|"Charged Off" }
   ],
@@ -262,6 +263,25 @@ export async function registerRoutes(
   "newestAccount": { "creditor": string, "year": number },
   "avgAccountAge": { "years": number, "months": number }
 }
+SCORE RULES:
+- If the report shows scores from multiple bureaus (Equifax / Experian / TransUnion — common in tri-merge mortgage reports), populate ALL THREE in bureauScores.
+- For the top-level "creditScore" + "creditScoreSource", pick the MIDDLE of the three (mortgage mid-score). If only 2 scores are shown, pick the lower. If only 1 is shown, use it.
+- Score sources commonly appear under headers like "Credit Scores", "FICO Score", "Score Summary", or in a 3-column block at the top of the report.
+
+CRITICAL CHARGE-OFF vs COLLECTION RULES (most common source of errors):
+- A "paid-collection" / "collection" / "placed for collection" / "in collection" → goes in collections[], NOT chargeOffs[].
+- A "charge-off" / "charged off" / "paid-chargeOff" → goes in chargeOffs[], NOT collections[].
+- The status field on each tradeline (e.g. "paid-collection" vs "paid-chargeOff") is the source of truth — read it carefully on each account.
+- Funding Suite mortgage reports list these in the tradeline table with an explicit account status column. NEVER guess based on creditor name alone (e.g. "Cap One" can be either — read its actual status).
+- An account can only appear in ONE of chargeOffs[] or collections[] — never both. The same physical account is not double-counted.
+- chargeOffsCount and collectionsCount on the final summary equal the array lengths — getting the bucket wrong shifts a count by 1.
+
+AVG ACCOUNT AGE RULES:
+- avgAccountAge.years and avgAccountAge.months together describe ONE duration (e.g. 5 years 7 months).
+- months MUST be in 0–11 range. NEVER use 0 months as a default — if you don't know the exact months, estimate from the opened dates of the tradelines you see.
+- If the report doesn't show any opened dates at all, set BOTH years and months to 0 (signals unknown).
+- Otherwise compute: average across all tradelines of (today - openedDate) in months, then split into years + remaining months.
+
 Also include a comprehensive flat list named allAccounts containing EVERY tradeline you see, in this format:
 "allAccounts": [
   { "creditor": string, "accountType": "Credit Card"|"Auto Loan"|"Mortgage"|"Student Loan"|"Personal Loan"|"Collection"|"Charge-Off"|"Repossession"|"Public Record"|"Other", "status": "Open"|"Closed"|"Paid"|"Current"|"Past Due"|"Charged Off"|"In Collection"|string, "openedYear": number|null, "balance": number|null }
@@ -422,7 +442,15 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
   // Build the credit-report patch + parsed payload
   async function buildCreditReportPatch(parsed: any) {
     const patch: any = {};
-    if (parsed.creditScore != null && parsed.creditScoreSource) {
+    // Prefer the tri-bureau breakdown when available (mortgage tri-merge reports)
+    const b = parsed.bureauScores || {};
+    const triParts: string[] = [];
+    if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
+    if (b.experian != null) triParts.push(`Experian ${b.experian}`);
+    if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
+    if (triParts.length >= 2) {
+      patch.recentCreditReport = triParts.join(", ");
+    } else if (parsed.creditScore != null && parsed.creditScoreSource) {
       patch.recentCreditReport = `${parsed.creditScore} (${parsed.creditScoreSource})`;
     } else if (parsed.creditScore != null) {
       patch.recentCreditReport = String(parsed.creditScore);
