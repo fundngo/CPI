@@ -10,6 +10,12 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 import Anthropic from "@anthropic-ai/sdk";
+import { renderPdfToPngs } from "./pdfVision";
+
+// Use real Anthropic model id (with dashes). The previous code used the LLM
+// API gateway alias "claude_sonnet_4_5" which only works inside the sandbox,
+// not against real api.anthropic.com. Configurable via env for easy upgrades.
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
 // pdf-parse v2 exports a PDFParse class with .getText()
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { PDFParse } = require("pdf-parse");
@@ -114,7 +120,7 @@ export async function registerRoutes(
   async function claudeJson(systemPrompt: string, userText: string): Promise<any> {
     const client = new Anthropic();
     const message = await client.messages.create({
-      model: "claude_sonnet_4_5" as any,
+      model: CLAUDE_MODEL as any,
       max_tokens: 16000,
       system: systemPrompt,
       messages: [{ role: "user", content: userText }],
@@ -147,6 +153,74 @@ export async function registerRoutes(
         );
       }
     }
+  }
+
+  // Vision-based extraction: send PDF pages as images so Claude can read PDFs
+  // with encoded/CID fonts (Funding Suite, MyFICO exports, scanned PDFs).
+  async function claudeJsonFromImages(systemPrompt: string, userText: string, pages: { base64Png: string }[]): Promise<any> {
+    const client = new Anthropic();
+    const content: any[] = [{ type: "text", text: userText }];
+    for (const p of pages) {
+      content.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: p.base64Png },
+      });
+    }
+    const message = await client.messages.create({
+      model: CLAUDE_MODEL as any,
+      max_tokens: 16000,
+      system: systemPrompt,
+      messages: [{ role: "user", content }],
+    });
+    const text = (message.content || [])
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n")
+      .trim();
+    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    try { return JSON.parse(stripped); } catch {}
+    const match = stripped.match(/\{[\s\S]*\}/);
+    const candidate = match ? match[0] : stripped;
+    try {
+      return JSON.parse(candidate);
+    } catch (firstErr: any) {
+      try {
+        const repaired = repairTruncatedJson(candidate);
+        return JSON.parse(repaired);
+      } catch {
+        throw new Error("Could not parse vision-extracted JSON: " + (firstErr?.message || "unknown"));
+      }
+    }
+  }
+
+  /**
+   * Run an extraction prompt against a PDF. Tries text extraction first (fast,
+   * cheap). If the PDF is image-only or uses encoded fonts (garbled text),
+   * falls back to rendering pages and using vision. Returns parsed JSON.
+   */
+  async function extractFromPdf(
+    base64: string,
+    systemPrompt: string,
+    userTextTemplate: (pdfText: string) => string,
+    visionInstruction: string,
+  ): Promise<{ parsed: any; method: "text" | "vision" }> {
+    const { text: pdfText, error } = await extractPdfText(base64);
+    if (pdfText && !error) {
+      const parsed = await claudeJson(systemPrompt, userTextTemplate(pdfText));
+      return { parsed, method: "text" };
+    }
+    // Text path failed (image-only, encoded fonts, or unreadable). Try vision.
+    let pages;
+    try {
+      pages = await renderPdfToPngs(base64, { maxPages: 12, scale: 1.5 });
+    } catch (e: any) {
+      throw new Error(error || `Could not render PDF: ${e?.message || "unknown error"}`);
+    }
+    if (!pages.length) {
+      throw new Error(error || "PDF has no pages to read");
+    }
+    const parsed = await claudeJsonFromImages(systemPrompt, visionInstruction, pages);
+    return { parsed, method: "vision" };
   }
 
   const CREDIT_REPORT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
@@ -280,12 +354,13 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     try {
       const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
       if (!fileBase64) return res.status(400).json({ message: "Missing fileBase64" });
-      const { text: pdfText, error } = await extractPdfText(fileBase64);
-      if (error || !pdfText) return res.status(422).json({ message: error || "No text" });
-      const parsed = await claudeJson(
+      const { parsed, method } = await extractFromPdf(
+        fileBase64,
         CREDIT_REPORT_SCHEMA_PROMPT,
-        `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`
+        (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
+        `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
       );
+      console.log(`[extract-credit-report] method=${method} fileName=${fileName || "(none)"}`);
       // Strip known placeholders
       const cleanName = sanitizePlaceholder(parsed?.name, NAME_PLACEHOLDER_PATTERNS);
       const cleanAddress = sanitizePlaceholder(parsed?.address, ADDR_PLACEHOLDER_PATTERNS);
@@ -431,12 +506,13 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
         const fullFile = await storage.getFile(latestCreditReport.id);
         const base64 = (fullFile as any)?.base64Content;
         if (!base64) throw new Error("Credit report file has no content stored");
-        const { text: pdfText, error } = await extractPdfText(base64);
-        if (error || !pdfText) throw new Error(error || "No text in credit report PDF");
-        const parsed = await claudeJson(
+        const { parsed, method } = await extractFromPdf(
+          base64,
           CREDIT_REPORT_SCHEMA_PROMPT,
-          `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`
+          (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
+          `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
         );
+        console.log(`[preview-credit-report] method=${method} fileName=${latestCreditReport.fileName}`);
         const patch = await buildCreditReportPatch(parsed);
         const fieldDiffs = diffPatch(client, patch);
         // Table-level diffs: just count comparisons
@@ -475,12 +551,13 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
         const fullFile = await storage.getFile(latestBankStatement.id);
         const base64 = (fullFile as any)?.base64Content;
         if (!base64) throw new Error("Bank statement file has no content stored");
-        const { text: pdfText, error } = await extractPdfText(base64);
-        if (error || !pdfText) throw new Error(error || "No text in bank statement PDF");
-        const parsed = await claudeJson(
+        const { parsed, method } = await extractFromPdf(
+          base64,
           BANK_STATEMENT_SCHEMA_PROMPT,
-          `Extract bank account info from this statement text. Return ONLY the JSON object per the schema.\n\n--- BANK STATEMENT TEXT ---\n${pdfText}\n--- END ---`
+          (pdfText) => `Extract bank account info from this statement text. Return ONLY the JSON object per the schema.\n\n--- BANK STATEMENT TEXT ---\n${pdfText}\n--- END ---`,
+          `Extract bank account info from this statement. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
         );
+        console.log(`[preview-bank-statement] method=${method} fileName=${latestBankStatement.fileName}`);
         const { patch, isBiz, accounts } = buildBankPatch(parsed);
         const diffs = diffPatch(client, patch);
         out.bankStatement = {
