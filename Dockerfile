@@ -40,9 +40,11 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package*.json ./
 
-# /data is where the SQLite file lives. Mount a Railway Volume here.
+# /data is where the SQLite file lives.
+# Persistent storage is provided by attaching a Railway Volume to this service
+# in the Railway dashboard with mount path /data. Do NOT use the Docker VOLUME
+# instruction — Railway's Dockerfile validator rejects it.
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 EXPOSE 5000
 
