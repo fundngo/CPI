@@ -197,7 +197,16 @@ export function generateClientPdf(client: ClientWithDetails) {
   kvLine("Account Age", client.bankAccountsAge);
   kvLine("Has Savings", client.hasSavings ? "Yes" : "No");
   kvLine("Has Retirement / 401(k)", client.hasRetirement401k ? "Yes" : "No");
-  kvLine("Credit Report", client.recentCreditReport);
+  // Show all bureaus separately when available
+  const triBureauLines: string[] = [];
+  if (client.equifaxScore != null) triBureauLines.push(`Equifax ${client.equifaxScore}`);
+  if (client.experianScore != null) triBureauLines.push(`Experian ${client.experianScore}`);
+  if (client.transunionScore != null) triBureauLines.push(`TransUnion ${client.transunionScore}`);
+  if (triBureauLines.length > 0) {
+    kvLine("Credit Report", triBureauLines.join("  \u2022  "));
+  } else if (client.recentCreditReport) {
+    kvLine("Credit Report", client.recentCreditReport);
+  }
   if (client.personalNotes) kvLine("Notes", client.personalNotes);
   y += 8;
 

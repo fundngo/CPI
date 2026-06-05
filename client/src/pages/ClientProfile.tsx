@@ -292,7 +292,17 @@ export default function ClientProfile() {
             <ReadOnlyField label="Number of Personal Bank Accounts" value={client.numBankAccounts} />
             <ReadOnlyField label="Bank Accounts" value={client.bankAccountsList} />
             <ReadOnlyField label="Age of Bank Accounts" value={client.bankAccountsAge} />
-            <ReadOnlyField label="Recent Credit Report" value={client.recentCreditReport} />
+            <ReadOnlyField
+              label="Recent Credit Report"
+              value={(() => {
+                const parts: string[] = [];
+                if (client.equifaxScore != null) parts.push(`Equifax ${client.equifaxScore}`);
+                if (client.experianScore != null) parts.push(`Experian ${client.experianScore}`);
+                if (client.transunionScore != null) parts.push(`TransUnion ${client.transunionScore}`);
+                if (parts.length > 0) return parts.join(", ");
+                return client.recentCreditReport;
+              })()}
+            />
             <ReadOnlyBool label="Has Savings Account" value={client.hasSavings} />
             <ReadOnlyBool label="Has Retirement / 401(k)" value={client.hasRetirement401k} />
             <ReadOnlyField label="Personal Notes" value={client.personalNotes} multiline />

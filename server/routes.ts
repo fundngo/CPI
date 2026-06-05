@@ -406,6 +406,9 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
   // ====== Field-label registry for the review modal ======
   const FIELD_LABELS: Record<string, { label: string; section: string; format?: "number" | "text" | "bool" | "money" | "percent" }> = {
     recentCreditReport: { label: "Credit Score", section: "Credit Report", format: "text" },
+    equifaxScore: { label: "Equifax Score", section: "Credit Report", format: "number" },
+    experianScore: { label: "Experian Score", section: "Credit Report", format: "number" },
+    transunionScore: { label: "TransUnion Score", section: "Credit Report", format: "number" },
     totalAccountsCount: { label: "Accounts Found", section: "Credit Report", format: "number" },
     creditUtilization: { label: "Credit Utilization", section: "Credit Report", format: "percent" },
     chargeOffsCount: { label: "Charge-Offs", section: "Credit Report", format: "number" },
@@ -448,6 +451,9 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
     if (b.experian != null) triParts.push(`Experian ${b.experian}`);
     if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
+    if (b.equifax != null) patch.equifaxScore = b.equifax;
+    if (b.experian != null) patch.experianScore = b.experian;
+    if (b.transunion != null) patch.transunionScore = b.transunion;
     if (triParts.length >= 2) {
       patch.recentCreditReport = triParts.join(", ");
     } else if (parsed.creditScore != null && parsed.creditScoreSource) {

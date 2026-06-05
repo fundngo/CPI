@@ -143,9 +143,16 @@ export default function AddClient() {
   const createMutation = useMutation({
     mutationFn: async () => {
       if (!extracted) throw new Error("Nothing to create");
-      // Build a credit report summary string
+      // Build a credit report summary string. Prefer tri-bureau if available.
+      const b = (extracted as any).bureauScores || {};
+      const triParts: string[] = [];
+      if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
+      if (b.experian != null) triParts.push(`Experian ${b.experian}`);
+      if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
       const reportSummary =
-        extracted.creditScore != null
+        triParts.length >= 2
+          ? triParts.join(", ")
+          : extracted.creditScore != null
           ? `${extracted.creditScore}${extracted.creditScoreSource ? ` (${extracted.creditScoreSource})` : ""}`
           : "";
 
@@ -171,6 +178,9 @@ export default function AddClient() {
         onboardingDate: today,
         status: "New" as const,
         recentCreditReport: reportSummary,
+        equifaxScore: b.equifax ?? null,
+        experianScore: b.experian ?? null,
+        transunionScore: b.transunion ?? null,
         personalNotes: "",
         creditAnalysisDate: today,
         chargeOffsCount: chargeOffsList.length,

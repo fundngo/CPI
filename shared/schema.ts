@@ -46,6 +46,10 @@ export const clients = sqliteTable("clients", {
   hasSavings: integer("has_savings", { mode: "boolean" }).notNull().default(false),
   hasRetirement401k: integer("has_retirement_401k", { mode: "boolean" }).notNull().default(false),
   recentCreditReport: text("recent_credit_report").notNull().default(""),
+  // Tri-bureau scores (preferred over recentCreditReport free text)
+  equifaxScore: integer("equifax_score"),
+  experianScore: integer("experian_score"),
+  transunionScore: integer("transunion_score"),
   creditUtilization: real("credit_utilization").notNull().default(0),
 
   // Business

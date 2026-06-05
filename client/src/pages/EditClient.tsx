@@ -100,6 +100,9 @@ export default function EditClient() {
         "hasSavings",
         "hasRetirement401k",
         "recentCreditReport",
+        "equifaxScore",
+        "experianScore",
+        "transunionScore",
         "activeLLC",
         "llcName",
         "hasBusinessAccounts",
@@ -120,6 +123,17 @@ export default function EditClient() {
       ];
       for (const k of fields) {
         if (form[k] !== undefined) clientPayload[k as string] = form[k];
+      }
+      // Auto-build recentCreditReport string from bureau scores when override is blank
+      const eq = form.equifaxScore;
+      const ex = form.experianScore;
+      const tu = form.transunionScore;
+      const triParts: string[] = [];
+      if (eq != null && eq !== 0) triParts.push(`Equifax ${eq}`);
+      if (ex != null && ex !== 0) triParts.push(`Experian ${ex}`);
+      if (tu != null && tu !== 0) triParts.push(`TransUnion ${tu}`);
+      if (triParts.length > 0 && !form.recentCreditReport?.trim()) {
+        clientPayload.recentCreditReport = triParts.join(", ");
       }
       await apiRequest("PATCH", `/api/clients/${id}`, clientPayload);
 
@@ -302,10 +316,53 @@ export default function EditClient() {
               onChange={(v) => update("hasRetirement401k", v)}
               testId="check-edit-401k"
             />
-            <FormField label="Recent Credit Report" className="md:col-span-2">
+            <FormField label="Equifax Score">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={300}
+                max={850}
+                value={form.equifaxScore ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value.trim();
+                  update("equifaxScore", v === "" ? null : Number(v));
+                }}
+                data-testid="input-edit-equifax"
+              />
+            </FormField>
+            <FormField label="Experian Score">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={300}
+                max={850}
+                value={form.experianScore ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value.trim();
+                  update("experianScore", v === "" ? null : Number(v));
+                }}
+                data-testid="input-edit-experian"
+              />
+            </FormField>
+            <FormField label="TransUnion Score">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={300}
+                max={850}
+                value={form.transunionScore ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value.trim();
+                  update("transunionScore", v === "" ? null : Number(v));
+                }}
+                data-testid="input-edit-transunion"
+              />
+            </FormField>
+            <FormField label="Recent Credit Report (optional override)" className="md:col-span-2">
               <Input
                 value={form.recentCreditReport || ""}
                 onChange={(e) => update("recentCreditReport", e.target.value)}
+                placeholder="Auto-built from scores above when blank"
                 data-testid="input-edit-credit-report"
               />
             </FormField>

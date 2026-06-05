@@ -191,6 +191,51 @@ function columnExists(table: string, column: string): boolean {
 if (!columnExists("clients", "address")) {
   sqlite.exec(`ALTER TABLE clients ADD COLUMN address TEXT NOT NULL DEFAULT ''`);
 }
+// Tri-bureau credit score columns
+if (!columnExists("clients", "equifax_score")) {
+  sqlite.exec(`ALTER TABLE clients ADD COLUMN equifax_score INTEGER`);
+}
+if (!columnExists("clients", "experian_score")) {
+  sqlite.exec(`ALTER TABLE clients ADD COLUMN experian_score INTEGER`);
+}
+if (!columnExists("clients", "transunion_score")) {
+  sqlite.exec(`ALTER TABLE clients ADD COLUMN transunion_score INTEGER`);
+  // One-time backfill: parse existing recent_credit_report free-text into the
+  // 3 columns. Handles formats like:
+  //   "Equifax 702, Experian 691, TransUnion 708"
+  //   "747 (TransUnion)"
+  //   "720" (no bureau → we leave columns null and keep free text)
+  try {
+    const rows = sqlite.prepare(
+      `SELECT id, recent_credit_report FROM clients WHERE recent_credit_report IS NOT NULL AND recent_credit_report != ''`,
+    ).all() as Array<{ id: number; recent_credit_report: string }>;
+    const update = sqlite.prepare(
+      `UPDATE clients SET equifax_score = ?, experian_score = ?, transunion_score = ? WHERE id = ?`,
+    );
+    for (const r of rows) {
+      const s = r.recent_credit_report;
+      let eq: number | null = null, ex: number | null = null, tu: number | null = null;
+      // Pattern 1: "<Bureau> <score>"
+      const m1 = s.match(/equifax\s*[:\-]?\s*(\d{2,3})/i); if (m1) eq = parseInt(m1[1]);
+      const m2 = s.match(/experian\s*[:\-]?\s*(\d{2,3})/i); if (m2) ex = parseInt(m2[1]);
+      const m3 = s.match(/trans\s*union\s*[:\-]?\s*(\d{2,3})/i); if (m3) tu = parseInt(m3[1]);
+      // Pattern 2: "<score> (<Bureau>)"
+      const m4 = s.match(/(\d{2,3})\s*\(\s*(equifax|experian|trans\s*union)\s*\)/i);
+      if (m4) {
+        const score = parseInt(m4[1]);
+        const bureau = m4[2].toLowerCase().replace(/\s+/g, "");
+        if (bureau === "equifax" && eq == null) eq = score;
+        if (bureau === "experian" && ex == null) ex = score;
+        if (bureau === "transunion" && tu == null) tu = score;
+      }
+      if (eq != null || ex != null || tu != null) {
+        update.run(eq, ex, tu, r.id);
+      }
+    }
+  } catch (e) {
+    console.warn("Tri-bureau backfill skipped:", e);
+  }
+}
 
 export const db = drizzle(sqlite);
 
