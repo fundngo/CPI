@@ -274,7 +274,7 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.text("UTIL", colUtil, y, { align: "right" });
     doc.text("TGT 30%", colT30, y, { align: "right" });
     doc.text("TGT 15%", colT15, y, { align: "right" });
-    doc.text("PAY TO 15%", colPay, y, { align: "right" });
+    doc.text("PAYDOWN", colPay, y, { align: "right" });
     y += 8;
     doc.setDrawColor(220, 224, 232);
     doc.line(margin, y, W - margin, y);
@@ -286,14 +286,14 @@ export function generateClientPdf(client: ClientWithDetails) {
     let totBal = 0;
     let totT30 = 0;
     let totT15 = 0;
-    let totPay15 = 0;
+    let totPay30 = 0;
     for (const card of client.creditCards) {
       ensure(16);
       const util = cardUtilization(card);
       const bucket = utilBucket(util);
       const t30 = targetBalanceAt(card.creditLimit, 30);
       const t15 = targetBalanceAt(card.creditLimit, 15);
-      const p15 = paydownTo(card.currentBalance, card.creditLimit, 15);
+      const p30 = paydownTo(card.currentBalance, card.creditLimit, 30);
 
       // tinted row background + colored left bar
       doc.setFillColor(...BUCKET_TINT[bucket]);
@@ -330,10 +330,10 @@ export function generateClientPdf(client: ClientWithDetails) {
       doc.text(fmtCurrency(t30), colT30, y, { align: "right" });
       doc.text(fmtCurrency(t15), colT15, y, { align: "right" });
 
-      if (p15 > 0) {
+      if (p30 > 0) {
         doc.setTextColor(...BUCKET_TEXT[bucket]);
         doc.setFont("helvetica", "bold");
-        doc.text(fmtCurrency(p15), colPay, y, { align: "right" });
+        doc.text(fmtCurrency(p30), colPay, y, { align: "right" });
         doc.setFont("helvetica", "normal");
         doc.setTextColor(40, 50, 70);
       } else {
@@ -346,7 +346,7 @@ export function generateClientPdf(client: ClientWithDetails) {
       totBal += card.currentBalance || 0;
       totT30 += t30;
       totT15 += t15;
-      totPay15 += p15;
+      totPay30 += p30;
       y += 16;
     }
 
@@ -363,9 +363,9 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.text(`${overallUtilization(client.creditCards).toFixed(1)}%`, colUtil, y, { align: "right" });
     doc.text(fmtCurrency(totT30), colT30, y, { align: "right" });
     doc.text(fmtCurrency(totT15), colT15, y, { align: "right" });
-    if (totPay15 > 0) {
+    if (totPay30 > 0) {
       doc.setTextColor(...BUCKET_TEXT.red);
-      doc.text(fmtCurrency(totPay15), colPay, y, { align: "right" });
+      doc.text(fmtCurrency(totPay30), colPay, y, { align: "right" });
     } else {
       doc.setTextColor(...BUCKET_TEXT.green);
       doc.text("On target", colPay, y, { align: "right" });
