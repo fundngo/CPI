@@ -253,13 +253,15 @@ export function generateClientPdf(client: ClientWithDetails) {
     ensure(36);
     // Simplified 7-column layout — just show LIMIT, BAL, UTIL, and the two
     // balance targets so clients see the max they can carry, not paydown math.
+    // Page usable width is 516pt; right-align rightmost columns and keep a
+    // generous gap between 30% / 15% so "BALANCE" headers fit without crowding.
     const colCard = margin;
-    const colIssuer = margin + 114;
-    const colLimit = margin + 270;
-    const colBalance = margin + 340;
-    const colUtil = margin + 390;
-    const colT30 = margin + 450;
-    const colT15 = W - margin;
+    const colIssuer = margin + 100;
+    const colLimit = margin + 240;
+    const colBalance = margin + 300;
+    const colUtil = margin + 350;
+    const colT30 = margin + 425;        // gap of 75pt to UTIL
+    const colT15 = W - margin;          // ends at right edge; gap of ~91pt to T30
     // Soft, eye-friendly target colors
     const LIGHT_AMBER: [number, number, number] = [224, 169, 58];
     const LIGHT_GREEN: [number, number, number] = [107, 191, 107];

@@ -65,8 +65,8 @@ export function CreditCardsSection({ cards }: { clientId?: number; cards: Credit
               <th className="px-3 py-2.5 text-right font-medium">Limit</th>
               <th className="px-3 py-2.5 text-right font-medium">Balance</th>
               <th className="px-3 py-2.5 text-right font-medium">Util %</th>
-              <th className="px-3 py-2.5 text-right font-medium">Target @ 30%</th>
-              <th className="px-3 py-2.5 text-right font-medium">Target @ 15%</th>
+              <th className="px-3 py-2.5 text-right font-medium">30% Balance</th>
+              <th className="px-3 py-2.5 text-right font-medium">15% Balance</th>
               <th className="px-3 py-2.5 text-right font-medium">Paydown to 30%</th>
               <th className="px-3 py-2.5 text-left font-medium">Status</th>
             </tr>
