@@ -242,24 +242,18 @@ export function generateClientPdf(client: ClientWithDetails) {
     y += 16;
 
     ensure(36);
-    // 9-column layout for CPI sheet (page usable width 516pt with 48pt margins):
-    // CARD (left)        : margin .. margin+92
-    // ISSUER (left)      : margin+98 .. margin+178
-    // LIMIT (right)      : margin+236
-    // BALANCE (right)    : margin+296
-    // UTIL (right)       : margin+340
-    // TARGET 30 (right)  : margin+390
-    // TARGET 15 (right)  : margin+440
-    // PAYDOWN 30 (right) : margin+498
-    // STATUS dropped to keep things readable in PDF (still in app)
+    // Simplified 7-column layout — just show LIMIT, BAL, UTIL, and the two
+    // balance targets so clients see the max they can carry, not paydown math.
     const colCard = margin;
-    const colIssuer = margin + 98;
-    const colLimit = margin + 236;
-    const colBalance = margin + 296;
-    const colUtil = margin + 340;
-    const colT30 = margin + 390;
-    const colT15 = margin + 440;
-    const colPay = margin + 498;
+    const colIssuer = margin + 114;
+    const colLimit = margin + 270;
+    const colBalance = margin + 340;
+    const colUtil = margin + 390;
+    const colT30 = margin + 450;
+    const colT15 = W - margin;
+    // Soft, eye-friendly target colors
+    const LIGHT_AMBER: [number, number, number] = [224, 169, 58];
+    const LIGHT_GREEN: [number, number, number] = [107, 191, 107];
 
     // Header row
     doc.setFillColor(...muted);
@@ -272,9 +266,11 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.text("LIMIT", colLimit, y, { align: "right" });
     doc.text("BAL", colBalance, y, { align: "right" });
     doc.text("UTIL", colUtil, y, { align: "right" });
-    doc.text("TGT 30%", colT30, y, { align: "right" });
-    doc.text("TGT 15%", colT15, y, { align: "right" });
-    doc.text("PAYDOWN", colPay, y, { align: "right" });
+    doc.setTextColor(...LIGHT_AMBER);
+    doc.text("30% BALANCE", colT30, y, { align: "right" });
+    doc.setTextColor(...LIGHT_GREEN);
+    doc.text("15% BALANCE", colT15, y, { align: "right" });
+    doc.setTextColor(...slate);
     y += 8;
     doc.setDrawColor(220, 224, 232);
     doc.line(margin, y, W - margin, y);
@@ -286,14 +282,12 @@ export function generateClientPdf(client: ClientWithDetails) {
     let totBal = 0;
     let totT30 = 0;
     let totT15 = 0;
-    let totPay30 = 0;
     for (const card of client.creditCards) {
       ensure(16);
       const util = cardUtilization(card);
       const bucket = utilBucket(util);
       const t30 = targetBalanceAt(card.creditLimit, 30);
       const t15 = targetBalanceAt(card.creditLimit, 15);
-      const p30 = paydownTo(card.currentBalance, card.creditLimit, 30);
 
       // tinted row background + colored left bar
       doc.setFillColor(...BUCKET_TINT[bucket]);
@@ -327,26 +321,19 @@ export function generateClientPdf(client: ClientWithDetails) {
       doc.setFont("helvetica", "normal");
       doc.setTextColor(40, 50, 70);
 
+      // 30% target in light amber, 15% target in light green
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(...LIGHT_AMBER);
       doc.text(fmtCurrency(t30), colT30, y, { align: "right" });
+      doc.setTextColor(...LIGHT_GREEN);
       doc.text(fmtCurrency(t15), colT15, y, { align: "right" });
-
-      if (p30 > 0) {
-        doc.setTextColor(...BUCKET_TEXT[bucket]);
-        doc.setFont("helvetica", "bold");
-        doc.text(fmtCurrency(p30), colPay, y, { align: "right" });
-        doc.setFont("helvetica", "normal");
-        doc.setTextColor(40, 50, 70);
-      } else {
-        doc.setTextColor(...BUCKET_TEXT.green);
-        doc.text("On target", colPay, y, { align: "right" });
-        doc.setTextColor(40, 50, 70);
-      }
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(40, 50, 70);
 
       totLimit += card.creditLimit || 0;
       totBal += card.currentBalance || 0;
       totT30 += t30;
       totT15 += t15;
-      totPay30 += p30;
       y += 16;
     }
 
@@ -361,17 +348,12 @@ export function generateClientPdf(client: ClientWithDetails) {
     doc.text(fmtCurrency(totLimit), colLimit, y, { align: "right" });
     doc.text(fmtCurrency(totBal), colBalance, y, { align: "right" });
     doc.text(`${overallUtilization(client.creditCards).toFixed(1)}%`, colUtil, y, { align: "right" });
+    doc.setTextColor(...LIGHT_AMBER);
     doc.text(fmtCurrency(totT30), colT30, y, { align: "right" });
+    doc.setTextColor(...LIGHT_GREEN);
     doc.text(fmtCurrency(totT15), colT15, y, { align: "right" });
-    if (totPay30 > 0) {
-      doc.setTextColor(...BUCKET_TEXT.red);
-      doc.text(fmtCurrency(totPay30), colPay, y, { align: "right" });
-    } else {
-      doc.setTextColor(...BUCKET_TEXT.green);
-      doc.text("On target", colPay, y, { align: "right" });
-    }
-    doc.setFont("helvetica", "normal");
     doc.setTextColor(40, 50, 70);
+    doc.setFont("helvetica", "normal");
     y += 18;
   }
   y += 8;
