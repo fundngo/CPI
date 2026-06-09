@@ -175,7 +175,25 @@ export default function ClientProfile() {
           <Button
             variant="outline"
             className="gap-2"
-            onClick={() => generateClientPdf(client)}
+            onClick={async () => {
+              try {
+                const res = await fetch(`/api/clients/${client.id}/credit-analysis`);
+                if (res.ok) {
+                  const credit = await res.json();
+                  generateClientPdf(client, {
+                    chargeOffs: credit.chargeOffs ?? [],
+                    collections: credit.collections ?? [],
+                    latePayments: credit.latePayments ?? [],
+                    repossessions: credit.repossessions ?? [],
+                    publicRecords: credit.publicRecords ?? [],
+                  });
+                } else {
+                  generateClientPdf(client);
+                }
+              } catch {
+                generateClientPdf(client);
+              }
+            }}
             data-testid="button-export-pdf"
           >
             <FileDown className="h-4 w-4" />

@@ -1,5 +1,20 @@
 import jsPDF from "jspdf";
-import type { ClientWithDetails } from "@shared/schema";
+import type {
+  ClientWithDetails,
+  ChargeOff,
+  Collection,
+  LatePayment,
+  Repossession,
+  PublicRecord,
+} from "@shared/schema";
+
+export interface CreditAnalysisPayload {
+  chargeOffs: ChargeOff[];
+  collections: Collection[];
+  latePayments: LatePayment[];
+  repossessions: Repossession[];
+  publicRecords: PublicRecord[];
+}
 import logoUrl from "@/assets/fund-go-logo.png";
 import {
   autoRecommendedSteps,
@@ -38,7 +53,10 @@ const BUCKET_TINT: Record<"green" | "yellow" | "red", [number, number, number]> 
   red: hexToRgb("#fef2f2"),
 };
 
-export function generateClientPdf(client: ClientWithDetails) {
+export function generateClientPdf(
+  client: ClientWithDetails,
+  credit?: CreditAnalysisPayload,
+) {
   const doc = new jsPDF({ unit: "pt", format: "letter" });
   const W = doc.internal.pageSize.getWidth();
   const H = doc.internal.pageSize.getHeight();
@@ -412,6 +430,16 @@ export function generateClientPdf(client: ClientWithDetails) {
     y += lines.length * 12;
   }
 
+  // ====== PAGE 2: CREDIT ANALYSIS REPORT ======
+  if (credit) {
+    renderCreditAnalysisPage(
+      doc,
+      client,
+      credit,
+      { W, H, margin, navy, slate, muted },
+    );
+  }
+
   // Footer
   const pageCount = doc.getNumberOfPages();
   for (let i = 1; i <= pageCount; i++) {
@@ -429,4 +457,335 @@ export function generateClientPdf(client: ClientWithDetails) {
 
   const safe = client.name.replace(/[^a-z0-9]+/gi, "_");
   doc.save(`CPI_${safe}.pdf`);
+}
+
+// ============================================================================
+// PAGE 2: Credit Analysis Report — derogs, collections, late payments, etc.
+// ============================================================================
+function renderCreditAnalysisPage(
+  doc: jsPDF,
+  client: ClientWithDetails,
+  credit: CreditAnalysisPayload,
+  ctx: {
+    W: number;
+    H: number;
+    margin: number;
+    navy: [number, number, number];
+    slate: [number, number, number];
+    muted: [number, number, number];
+  },
+) {
+  const { W, H, margin, navy, slate, muted } = ctx;
+  const red: [number, number, number] = [220, 38, 38];
+  doc.addPage();
+  let y = margin;
+
+  function ensure(space: number) {
+    if (y + space > H - margin) {
+      doc.addPage();
+      y = margin;
+    }
+  }
+
+  // ---- Title bar ----
+  doc.setFillColor(...navy);
+  doc.rect(0, 0, W, 56, "F");
+  doc.setTextColor(255, 255, 255);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text("Credit Analysis Report", margin, 36);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.text(client.name, W - margin, 36, { align: "right" });
+  y = 80;
+
+  // ---- KPI summary cards (2 rows) ----
+  function kpiCard(
+    x: number,
+    cy: number,
+    cw: number,
+    label: string,
+    value: string,
+    sub: string,
+    isNegative: boolean,
+  ) {
+    doc.setFillColor(...muted);
+    doc.rect(x, cy, cw, 56, "F");
+    if (isNegative) {
+      doc.setFillColor(...red);
+      doc.rect(x, cy, 3, 56, "F");
+    }
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(...slate);
+    doc.text(label.toUpperCase(), x + 10, cy + 14);
+    doc.setFontSize(20);
+    doc.setTextColor(...(isNegative ? red : navy));
+    doc.text(value, x + 10, cy + 36);
+    if (sub) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(...slate);
+      doc.text(sub, x + 10, cy + 50);
+    }
+  }
+
+  const cardW = (W - margin * 2 - 12 * 3) / 4;
+  const ageStr =
+    (client.avgAccountAgeYears || 0) === 0 && (client.avgAccountAgeMonths || 0) === 0
+      ? "—"
+      : `${client.avgAccountAgeYears}y ${client.avgAccountAgeMonths}m`;
+
+  kpiCard(
+    margin,
+    y,
+    cardW,
+    "Charge-Offs",
+    String(client.chargeOffsCount),
+    "",
+    client.chargeOffsCount > 0,
+  );
+  kpiCard(
+    margin + (cardW + 12),
+    y,
+    cardW,
+    "Collections",
+    String(client.collectionsCount),
+    "",
+    client.collectionsCount > 0,
+  );
+  kpiCard(
+    margin + (cardW + 12) * 2,
+    y,
+    cardW,
+    "Late Payments",
+    String(client.latePaymentsCount),
+    "",
+    client.latePaymentsCount > 0,
+  );
+  kpiCard(
+    margin + (cardW + 12) * 3,
+    y,
+    cardW,
+    "Avg Account Age",
+    ageStr,
+    `${client.totalAccountsCount} total accounts`,
+    false,
+  );
+  y += 64;
+
+  // Row 2: Repossessions, Public Records (just 2 cards left-aligned)
+  kpiCard(
+    margin,
+    y,
+    cardW,
+    "Repossessions",
+    String(client.repossessionsCount),
+    "",
+    client.repossessionsCount > 0,
+  );
+  kpiCard(
+    margin + (cardW + 12),
+    y,
+    cardW,
+    "Public Records",
+    String(client.publicRecordsCount),
+    "",
+    client.publicRecordsCount > 0,
+  );
+  y += 72;
+
+  // ---- Credit Age Overview ----
+  doc.setFillColor(...muted);
+  doc.rect(margin, y, W - margin * 2, 56, "F");
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(10);
+  doc.setTextColor(...navy);
+  doc.text("Credit Age Overview", margin + 12, y + 16);
+
+  const col1X = margin + 12;
+  const col2X = margin + (W - margin * 2) / 3;
+  const col3X = margin + ((W - margin * 2) * 2) / 3;
+
+  function ageLabel(lx: number, label: string, value: string) {
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(...slate);
+    doc.text(label.toUpperCase(), lx, y + 32);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    doc.setTextColor(...navy);
+    doc.text(value, lx, y + 48);
+  }
+  ageLabel(
+    col1X,
+    "Oldest Account",
+    `${client.oldestAccountCreditor || "—"}${client.oldestAccountYear ? ` (${client.oldestAccountYear})` : ""}`,
+  );
+  ageLabel(
+    col2X,
+    "Newest Account",
+    `${client.newestAccountCreditor || "—"}${client.newestAccountYear ? ` (${client.newestAccountYear})` : ""}`,
+  );
+  ageLabel(col3X, "Accounts Found", String(client.totalAccountsCount));
+  y += 72;
+
+  // ---- Helper: render a data table ----
+  function fmtMoney(v: number | null | undefined): string {
+    if (v == null || Number.isNaN(v)) return "—";
+    return `$${Number(v).toLocaleString()}`;
+  }
+
+  function renderTable<T extends Record<string, unknown>>(
+    title: string,
+    count: number,
+    columns: Array<{ header: string; render: (row: T) => string; width: number }>,
+    rows: T[],
+  ) {
+    if (rows.length === 0) return;
+    ensure(60);
+    // Heading bar
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(...navy);
+    doc.text(title, margin, y);
+    // Count badge
+    const titleW = doc.getTextWidth(title);
+    doc.setFillColor(...red);
+    doc.roundedRect(margin + titleW + 8, y - 10, 18, 14, 7, 7, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(8);
+    doc.text(String(count), margin + titleW + 8 + 9, y, { align: "center" });
+    y += 12;
+
+    // Column header row
+    doc.setFillColor(...muted);
+    doc.rect(margin, y, W - margin * 2, 18, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7);
+    doc.setTextColor(...slate);
+    let x = margin + 8;
+    for (const col of columns) {
+      doc.text(col.header, x, y + 12);
+      x += col.width;
+    }
+    y += 18;
+
+    // Data rows
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(40, 50, 70);
+    for (const row of rows) {
+      ensure(16);
+      let cx = margin + 8;
+      for (const col of columns) {
+        const text = col.render(row) || "—";
+        const lines = doc.splitTextToSize(text, col.width - 6);
+        doc.text(lines[0] || "", cx, y + 11);
+        cx += col.width;
+      }
+      // Subtle row separator
+      doc.setDrawColor(230, 232, 240);
+      doc.setLineWidth(0.3);
+      doc.line(margin, y + 16, W - margin, y + 16);
+      y += 16;
+    }
+    y += 10;
+  }
+
+  // ---- Repossessions ----
+  const totalW = W - margin * 2 - 16;
+  renderTable<Repossession>(
+    "Repossessions",
+    credit.repossessions.length,
+    [
+      { header: "CREDITOR", render: (r) => r.creditor, width: totalW * 0.22 },
+      { header: "TYPE", render: (r) => r.accountType || "—", width: totalW * 0.16 },
+      { header: "ORIGINAL", render: (r) => fmtMoney(r.originalAmount), width: totalW * 0.16 },
+      { header: "BALANCE", render: (r) => fmtMoney(r.balance), width: totalW * 0.16 },
+      { header: "OPENED", render: (r) => r.openedDate || "—", width: totalW * 0.14 },
+      { header: "REPO DATE", render: (r) => r.repoDate || "—", width: totalW * 0.16 },
+    ],
+    credit.repossessions,
+  );
+
+  // ---- Charge-Offs ----
+  renderTable<ChargeOff>(
+    "Charge-Off Accounts",
+    credit.chargeOffs.length,
+    [
+      { header: "CREDITOR", render: (r) => r.creditor, width: totalW * 0.22 },
+      { header: "TYPE", render: (r) => r.accountType, width: totalW * 0.16 },
+      { header: "ORIGINAL", render: (r) => fmtMoney(r.originalAmount), width: totalW * 0.16 },
+      { header: "BALANCE", render: (r) => fmtMoney(r.balance), width: totalW * 0.16 },
+      { header: "OPENED", render: (r) => r.openedDate || "—", width: totalW * 0.14 },
+      { header: "CLOSED", render: (r) => r.closedDate || "—", width: totalW * 0.16 },
+    ],
+    credit.chargeOffs,
+  );
+
+  // ---- Collections ----
+  renderTable<Collection>(
+    "Collections",
+    credit.collections.length,
+    [
+      { header: "CREDITOR", render: (r) => r.creditor, width: totalW * 0.28 },
+      { header: "ORIGINAL CREDITOR", render: (r) => r.originalCreditor || "—", width: totalW * 0.28 },
+      { header: "BALANCE", render: (r) => fmtMoney(r.balance), width: totalW * 0.22 },
+      { header: "REPORTED", render: (r) => r.reportedDate || "—", width: totalW * 0.22 },
+    ],
+    credit.collections,
+  );
+
+  // ---- Late Payments — bucket by recency ----
+  const within12: LatePayment[] = [];
+  const between12And24: LatePayment[] = [];
+  const olderCombined: LatePayment[] = [];
+  for (const lp of credit.latePayments) {
+    if (lp.withinTwelveMonths) within12.push(lp);
+    else if ((lp.monthsSinceLate ?? 99) <= 24) between12And24.push(lp);
+    else olderCombined.push(lp);
+  }
+
+  const lateCols = [
+    { header: "CREDITOR", render: (r: LatePayment) => r.creditor, width: totalW * 0.22 },
+    { header: "TYPE", render: (r: LatePayment) => r.accountType, width: totalW * 0.18 },
+    { header: "STATUS", render: (r: LatePayment) => r.status, width: totalW * 0.18 },
+    { header: "MOST RECENT", render: (r: LatePayment) => r.mostRecentLateDate || "—", width: totalW * 0.18 },
+    { header: "HISTORY", render: (r: LatePayment) => r.lateHistory || "—", width: totalW * 0.24 },
+  ];
+
+  renderTable<LatePayment>(
+    "Late Payments — Within 12 Months",
+    within12.length,
+    lateCols,
+    within12,
+  );
+  renderTable<LatePayment>(
+    "Late Payments — 12 to 24 Months",
+    between12And24.length,
+    lateCols,
+    between12And24,
+  );
+  renderTable<LatePayment>(
+    "Late Payments — Over 24 Months",
+    olderCombined.length,
+    lateCols,
+    olderCombined,
+  );
+
+  // ---- Public Records ----
+  renderTable<PublicRecord>(
+    "Public Records",
+    credit.publicRecords.length,
+    [
+      { header: "TYPE", render: (r) => r.recordType, width: totalW * 0.2 },
+      { header: "COURT / AGENCY", render: (r) => r.courtOrAgency || "—", width: totalW * 0.24 },
+      { header: "REFERENCE #", render: (r) => r.referenceNumber || "—", width: totalW * 0.18 },
+      { header: "AMOUNT", render: (r) => (r.amount > 0 ? fmtMoney(r.amount) : "—"), width: totalW * 0.14 },
+      { header: "STATUS", render: (r) => r.status || "—", width: totalW * 0.12 },
+      { header: "FILED", render: (r) => r.filedDate || "—", width: totalW * 0.12 },
+    ],
+    credit.publicRecords,
+  );
 }
