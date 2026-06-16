@@ -384,6 +384,54 @@ export function generateClientPdf(
     doc.setTextColor(40, 50, 70);
     doc.setFont("helvetica", "normal");
     y += 18;
+
+    // ===== Paydown summary box (30% / 15% targets) =====
+    const totBalance = totalBalance(client.creditCards);
+    const totLimitForBox = totalCreditLimit(client.creditCards);
+    if (totLimitForBox > 0) {
+      y += 10;
+      ensure(70);
+      const boxH = 60;
+      doc.setFillColor(...muted);
+      doc.setDrawColor(220, 224, 232);
+      doc.roundedRect(margin, y, W - margin * 2, boxH, 6, 6, "FD");
+
+      const target30 = totLimitForBox * 0.30;
+      const target15 = totLimitForBox * 0.15;
+      const paydown30 = Math.max(0, totBalance - target30);
+      const paydown15 = Math.max(0, totBalance - target15);
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(...navy);
+      doc.text("PAYDOWN TO HIT TARGET UTILIZATION", margin + 12, y + 16);
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(60, 70, 90);
+      doc.text("To reach 30% utilization: pay down", margin + 12, y + 34);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(...LIGHT_AMBER);
+      doc.text(fmtCurrency(paydown30), margin + 210, y + 34);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(60, 70, 90);
+      doc.text(`(balance drops to ${fmtCurrency(target30)})`, margin + 290, y + 34);
+
+      doc.text("To reach 15% utilization: pay down", margin + 12, y + 50);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(...LIGHT_GREEN);
+      doc.text(fmtCurrency(paydown15), margin + 210, y + 50);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(60, 70, 90);
+      doc.text(`(balance drops to ${fmtCurrency(target15)})`, margin + 290, y + 50);
+
+      y += boxH + 4;
+      doc.setTextColor(40, 50, 70);
+    }
   }
   y += 8;
 
