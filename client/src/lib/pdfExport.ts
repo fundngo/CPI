@@ -1,4 +1,5 @@
 import jsPDF from "jspdf";
+import { bucketLatePayments } from "@shared/creditLogic";
 import type {
   ClientWithDetails,
   ChargeOff,
@@ -19,7 +20,8 @@ import logoUrl from "@/assets/fund-go-logo.png";
 import {
   autoRecommendedSteps,
   businessBankingStrength,
-  businessRevenueStatus,
+  effectiveRevenueStatus,
+  effectiveUtilizationStatus,
   cardUtilization,
   fmtCurrency,
   fmtDate,
@@ -35,6 +37,7 @@ import {
   totalCreditLimit,
   utilBucket,
   utilizationStatus,
+  isOpenCard,
 } from "./calculations";
 
 // Hex → [r,g,b] for jsPDF (which only accepts numeric color triples).
@@ -174,7 +177,7 @@ export function generateClientPdf(
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
-  doc.text(utilizationStatus(util), colX(3), y + 70);
+  doc.text(effectiveUtilizationStatus(client, util), colX(3), y + 70);
 
   y += 108;
 
@@ -235,7 +238,7 @@ export function generateClientPdf(
   kvLine("Generating Revenue", client.generatingRevenue ? "Yes" : "No");
   kvLine("Monthly Revenue", fmtCurrency(client.monthlyRevenue));
   kvLine("Annual Revenue", fmtCurrency(client.annualRevenue));
-  kvLine("Revenue Status", businessRevenueStatus(client.monthlyRevenue));
+  kvLine("Revenue Status", effectiveRevenueStatus(client));
   kvLine("Business Credit Cards", client.businessCreditCards);
   kvLine("Business Loans", client.businessLoans);
   kvLine("Lines of Credit", client.businessLinesOfCredit);
@@ -247,7 +250,7 @@ export function generateClientPdf(
   kvLine("Total Cards", `${client.creditCards.length}`);
   kvLine("Total Credit Limit", fmtCurrency(totalCreditLimit(client.creditCards)));
   kvLine("Total Balance", fmtCurrency(totalBalance(client.creditCards)));
-  kvLine("Overall Utilization", `${fmtPct(util, 1)} (${utilizationStatus(util)})`);
+  kvLine("Overall Utilization", `${fmtPct(util, 1)} (${effectiveUtilizationStatus(client, util)})`);
   y += 4;
 
   if (client.creditCards.length) {
@@ -258,11 +261,11 @@ export function generateClientPdf(
     doc.setFont("helvetica", "normal");
     doc.setTextColor(...slate);
     const legendY = y;
-    function legendDot(x: number, label: string, fill: [number, number, number]) {
+    const legendDot = (x: number, label: string, fill: [number, number, number]) => {
       doc.setFillColor(...fill);
       doc.circle(x + 3, legendY - 2.5, 2.5, "F");
       doc.text(label, x + 9, legendY);
-    }
+    };
     legendDot(margin, "Under 15% - Good", BUCKET_TEXT.green);
     legendDot(margin + 130, "15-30% - Watch", BUCKET_TEXT.yellow);
     legendDot(margin + 250, "Over 30% - Over target", BUCKET_TEXT.red);
@@ -311,8 +314,44 @@ export function generateClientPdf(
     let totBal = 0;
     let totT30 = 0;
     let totT15 = 0;
+    // Hard-truncate to a width (with ellipsis) so text never runs into the next column.
+    const truncateToWidth = (text: string, maxW: number): string => {
+      let s = text;
+      if (doc.getTextWidth(s) <= maxW) return s;
+      while (s.length > 1 && doc.getTextWidth(s + "\u2026") > maxW) {
+        s = s.slice(0, -1);
+      }
+      return s + "\u2026";
+    };
+    let excludedCount = 0;
     for (const card of client.creditCards) {
       ensure(16);
+      const limitText = fmtCurrency(card.creditLimit);
+      // Issuer gets whatever space is left before the right-aligned LIMIT figure.
+      const issuerMaxW = Math.max(40, Math.min(110, colLimit - colIssuer - doc.getTextWidth(limitText) - 8));
+
+      if (!isOpenCard(card)) {
+        // Closed / charged-off: shown for completeness, excluded from utilization and totals.
+        excludedCount++;
+        doc.setFillColor(245, 246, 248);
+        doc.rect(margin, y - 10, W - margin * 2, 16, "F");
+        doc.setFillColor(203, 213, 225);
+        doc.rect(margin, y - 10, 3, 16, "F");
+        doc.setTextColor(130, 140, 155);
+        doc.text(truncateToWidth(card.cardName || "—", 88), colCard + 5, y);
+        doc.text(truncateToWidth(card.issuer || "—", issuerMaxW), colIssuer, y);
+        doc.text(limitText, colLimit, y, { align: "right" });
+        doc.text(fmtCurrency(card.currentBalance), colBalance, y, { align: "right" });
+        doc.setFont("helvetica", "italic");
+        doc.setFontSize(8);
+        doc.text(`${card.accountStatus} - not counted`, colT15, y, { align: "right" });
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        doc.setTextColor(40, 50, 70);
+        y += 16;
+        continue;
+      }
+
       const util = cardUtilization(card);
       const bucket = utilBucket(util);
       const t30 = targetBalanceAt(card.creditLimit, 30);
@@ -325,22 +364,9 @@ export function generateClientPdf(
       doc.rect(margin, y - 10, 3, 16, "F");
 
       doc.setTextColor(40, 50, 70);
-      // Hard-truncate to fit columns — issuer must not overflow into the
-      // right-aligned LIMIT column. Available width for issuer ~ 110pt with
-      // an 8pt safety gap before the LIMIT figure starts.
-      function truncateToWidth(text: string, maxW: number): string {
-        let s = text;
-        if (doc.getTextWidth(s) <= maxW) return s;
-        while (s.length > 1 && doc.getTextWidth(s + "\u2026") > maxW) {
-          s = s.slice(0, -1);
-        }
-        return s + "\u2026";
-      }
-      const cardNameText = truncateToWidth(card.cardName || "—", 88);
-      const issuerText = truncateToWidth(card.issuer || "—", 110);
-      doc.text(cardNameText, colCard + 5, y);
-      doc.text(issuerText, colIssuer, y);
-      doc.text(fmtCurrency(card.creditLimit), colLimit, y, { align: "right" });
+      doc.text(truncateToWidth(card.cardName || "—", 88), colCard + 5, y);
+      doc.text(truncateToWidth(card.issuer || "—", issuerMaxW), colIssuer, y);
+      doc.text(limitText, colLimit, y, { align: "right" });
       doc.text(fmtCurrency(card.currentBalance), colBalance, y, { align: "right" });
 
       // util in bucket color, bold
@@ -373,7 +399,7 @@ export function generateClientPdf(
     doc.setFont("helvetica", "bold");
     doc.setFontSize(9);
     doc.setTextColor(...navy);
-    doc.text("TOTALS", colCard + 5, y);
+    doc.text(excludedCount > 0 ? "TOTALS (OPEN CARDS)" : "TOTALS", colCard + 5, y);
     doc.text(fmtCurrency(totLimit), colLimit, y, { align: "right" });
     doc.text(fmtCurrency(totBal), colBalance, y, { align: "right" });
     doc.text(`${overallUtilization(client.creditCards).toFixed(1)}%`, colUtil, y, { align: "right" });
@@ -786,14 +812,11 @@ function renderCreditAnalysisPage(
   );
 
   // ---- Late Payments — bucket by recency ----
-  const within12: LatePayment[] = [];
-  const between12And24: LatePayment[] = [];
-  const olderCombined: LatePayment[] = [];
-  for (const lp of credit.latePayments) {
-    if (lp.withinTwelveMonths) within12.push(lp);
-    else if ((lp.monthsSinceLate ?? 99) <= 24) between12And24.push(lp);
-    else olderCombined.push(lp);
-  }
+  const lateBuckets = bucketLatePayments(credit.latePayments);
+  const within12 = lateBuckets.within12;
+  const between12And24 = lateBuckets["12to24"];
+  const olderCombined = lateBuckets.over24;
+  const lateUnknown = lateBuckets.unknown;
 
   const lateCols = [
     { header: "CREDITOR", render: (r: LatePayment) => r.creditor, width: totalW * 0.22 },
@@ -821,6 +844,14 @@ function renderCreditAnalysisPage(
     lateCols,
     olderCombined,
   );
+  if (lateUnknown.length > 0) {
+    renderTable<LatePayment>(
+      "Late Payments — Date Not Reported",
+      lateUnknown.length,
+      lateCols,
+      lateUnknown,
+    );
+  }
 
   // ---- Public Records ----
   renderTable<PublicRecord>(

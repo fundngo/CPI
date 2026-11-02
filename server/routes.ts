@@ -9,531 +9,152 @@ import {
   insertUploadedFileSchema,
 } from "@shared/schema";
 import { z } from "zod";
-import Anthropic from "@anthropic-ai/sdk";
-import { renderPdfToPngs } from "./pdfVision";
+import {
+  extractCreditReport,
+  extractBankStatement,
+  buildCreditReportPatch,
+  buildBankPatch,
+  normalizeCreditReport,
+  toChildTables,
+  deriveNameFromFilename,
+} from "./extraction";
+import { formatBureauScores } from "@shared/creditLogic";
 
-// Use real Anthropic model id (with dashes). The previous code used the LLM
-// API gateway alias "claude_sonnet_4_5" which only works inside the sandbox,
-// not against real api.anthropic.com. Configurable via env for easy upgrades.
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
-// pdf-parse v2 exports a PDFParse class with .getText()
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { PDFParse } = require("pdf-parse");
+// ====== Field-label registry for the review modal ======
+export const FIELD_LABELS: Record<string, { label: string; section: string; format?: "number" | "text" | "bool" | "money" | "percent" }> = {
+  recentCreditReport: { label: "Credit Score", section: "Credit Report", format: "text" },
+  equifaxScore: { label: "Equifax Score", section: "Credit Report", format: "number" },
+  experianScore: { label: "Experian Score", section: "Credit Report", format: "number" },
+  transunionScore: { label: "TransUnion Score", section: "Credit Report", format: "number" },
+  totalAccountsCount: { label: "Accounts Found", section: "Credit Report", format: "number" },
+  creditUtilization: { label: "Credit Utilization", section: "Credit Report", format: "percent" },
+  chargeOffsCount: { label: "Charge-Offs", section: "Credit Report", format: "number" },
+  collectionsCount: { label: "Collections", section: "Credit Report", format: "number" },
+  repossessionsCount: { label: "Repossessions", section: "Credit Report", format: "number" },
+  publicRecordsCount: { label: "Public Records", section: "Credit Report", format: "number" },
+  latePaymentsCount: { label: "Late Payments (total)", section: "Credit Report", format: "number" },
+  latePaymentsWithin12moCount: { label: "Late — within 12mo", section: "Credit Report", format: "number" },
+  latePayments12to24moCount: { label: "Late — 12–24mo", section: "Credit Report", format: "number" },
+  latePaymentsOlder24moCount: { label: "Late — over 24mo", section: "Credit Report", format: "number" },
+  oldestAccountCreditor: { label: "Oldest Account Creditor", section: "Credit Report", format: "text" },
+  oldestAccountYear: { label: "Oldest Account Year", section: "Credit Report", format: "number" },
+  newestAccountCreditor: { label: "Newest Account Creditor", section: "Credit Report", format: "text" },
+  newestAccountYear: { label: "Newest Account Year", section: "Credit Report", format: "number" },
+  avgAccountAgeYears: { label: "Avg Account Age (years)", section: "Credit Report", format: "number" },
+  avgAccountAgeMonths: { label: "Avg Account Age (months)", section: "Credit Report", format: "number" },
+  creditAnalysisDate: { label: "Credit Analysis Date", section: "Credit Report", format: "text" },
+  // Tables (treated as one row each in the review modal)
+  __cards: { label: "Credit Cards (replace all)", section: "Credit Report", format: "text" },
+  __chargeOffs: { label: "Charge-Offs (replace all)", section: "Credit Report", format: "text" },
+  __collections: { label: "Collections (replace all)", section: "Credit Report", format: "text" },
+  __latePayments: { label: "Late Payments (replace all)", section: "Credit Report", format: "text" },
+  __repossessions: { label: "Repossessions (replace all)", section: "Credit Report", format: "text" },
+  __publicRecords: { label: "Public Records (replace all)", section: "Credit Report", format: "text" },
+  // Bank fields
+  numBankAccounts: { label: "# Personal Bank Accounts", section: "Banking", format: "number" },
+  bankAccountsList: { label: "Personal Bank Accounts", section: "Banking", format: "text" },
+  hasSavings: { label: "Has Savings", section: "Banking", format: "bool" },
+  hasRetirement401k: { label: "Has Retirement / 401k", section: "Banking", format: "bool" },
+  hasBusinessAccounts: { label: "Has Business Accounts", section: "Banking", format: "bool" },
+  businessAccountsList: { label: "Business Bank Accounts", section: "Banking", format: "text" },
+};
 
-export async function registerRoutes(
-  httpServer: Server,
-  app: Express
-): Promise<Server> {
-  // Increase body size for base64 file uploads
-  // (already set in index.ts via express.json default; bump via middleware)
+// Build the credit-report patch + parsed payload
 
+type Diff = {
+  key: string;
+  label: string;
+  section: string;
+  format: string;
+  currentValue: unknown;
+  proposedValue: unknown;
+  changed: boolean;
+};
+
+function diffPatch(current: Record<string, any>, patch: Record<string, any>): Diff[] {
+  const out: Diff[] = [];
+  for (const key of Object.keys(patch)) {
+    const meta = FIELD_LABELS[key];
+    if (!meta) continue;
+    const cur = current[key];
+    const next = patch[key];
+    const changed = String(cur ?? "") !== String(next ?? "");
+    out.push({ key, label: meta.label, section: meta.section, format: meta.format || "text", currentValue: cur, proposedValue: next, changed });
+  }
+  return out;
+}
+
+// ---- Request body schemas ----
+const base64Pdf = z.string().min(100, "File content is missing or empty");
+
+const extractBody = z.object({
+  fileBase64: base64Pdf,
+  fileName: z.string().max(500).optional(),
+});
+
+const looseRecord = z.record(z.string(), z.unknown());
+const looseArray = z.array(looseRecord).max(1000);
+
+const applyBody = z.object({
+  acceptedKeys: z.array(z.string()).max(200),
+  creditReportParsed: looseRecord.nullable().optional(),
+  bankStatementParsed: looseRecord.nullable().optional(),
+});
+
+const childArrays = {
+  creditCards: looseArray.optional(),
+  chargeOffs: looseArray.optional(),
+  collections: looseArray.optional(),
+  latePayments: looseArray.optional(),
+  repossessions: looseArray.optional(),
+  publicRecords: looseArray.optional(),
+};
+
+function parseId(raw: unknown): number | null {
+  const n = Number(Array.isArray(raw) ? raw[0] : raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function zodError(res: Response, e: z.ZodError) {
+  return res.status(400).json({ message: "Invalid request", errors: e.errors });
+}
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   await seedIfEmpty().catch((e) => console.error("Seed error:", e));
 
-  // ====== Shared helpers for PDF extraction ======
+  // Lightweight health check for Railway (no client data in the response).
+  app.get("/api/health", (_req: Request, res: Response) => {
+    res.json({ ok: true });
+  });
 
-  // Detect encoded/garbled PDF text. Funding Suite credit reports and other
-  // PDFs with custom CID-encoded fonts produce text where pdf-parse returns
-  // glyph-index codepoints, not real letters. If we fed that to the LLM it
-  // would hallucinate plausible-but-wrong tradelines. Bail out instead.
-  function looksGarbled(text: string): boolean {
-    if (!text) return true;
-    const sample = text.slice(0, 8000);
-    const total = sample.length;
-    if (total < 200) return false;
-    let asciiLetter = 0;
-    let weird = 0;
-    for (let i = 0; i < total; i++) {
-      const c = sample.charCodeAt(i);
-      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) asciiLetter++;
-      else if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) weird++;
-      else if (c >= 0x80 && c <= 0x9f) weird++;
-      else if (c >= 0xe000 && c <= 0xf8ff) weird++;
-    }
-    const letterRatio = asciiLetter / total;
-    const weirdRatio = weird / total;
-    return letterRatio < 0.20 || weirdRatio > 0.15;
-  }
-
-  async function extractPdfText(base64: string): Promise<{ text?: string; error?: string }> {
-    const cleaned = base64.includes(",") ? base64.split(",")[1] : base64;
-    try {
-      const pdfBuffer = Buffer.from(cleaned, "base64");
-      const parser = new PDFParse({ data: pdfBuffer });
-      const result = await parser.getText();
-      let pdfText = "";
-      if (typeof result?.text === "string") {
-        pdfText = result.text.trim();
-      } else if (Array.isArray(result?.pages)) {
-        pdfText = result.pages.map((p: any) => p.text || "").join("\n").trim();
-      }
-      await parser.destroy?.();
-      if (!pdfText || pdfText.length < 50) {
-        return { error: "This PDF has no readable text. It may be a scanned image — please try a text-based PDF or enter manually." };
-      }
-      if (looksGarbled(pdfText)) {
-        return { error: "This PDF uses encoded fonts that can't be read as text (common in Funding Suite mortgage reports and some MyFICO exports). Please enter the data manually or upload a different PDF export." };
-      }
-      const MAX_TEXT = 180000;
-      if (pdfText.length > MAX_TEXT) pdfText = pdfText.slice(0, MAX_TEXT);
-      return { text: pdfText };
-    } catch (err: any) {
-      console.error("PDF parse error:", err);
-      return { error: "Could not read this PDF. It may be image-only (scanned), password-protected, or corrupted." };
-    }
-  }
-
-  // Attempt to repair JSON that was truncated mid-array/object by Claude max_tokens.
-  // Strategy: walk the string, track string/escape/bracket state, then trim back to
-  // the last complete element and auto-close open arrays/objects.
-  function repairTruncatedJson(input: string): string {
-    let depth: string[] = []; // stack of '{' or '['
-    let inString = false;
-    let escape = false;
-    let lastSafe = -1; // index after the last complete top-level-ish element
-    let lastSafeDepth: string[] = [];
-    for (let i = 0; i < input.length; i++) {
-      const ch = input[i];
-      if (escape) { escape = false; continue; }
-      if (inString) {
-        if (ch === "\\") { escape = true; continue; }
-        if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') { inString = true; continue; }
-      if (ch === "{" || ch === "[") { depth.push(ch); continue; }
-      if (ch === "}" || ch === "]") { depth.pop(); continue; }
-      if (ch === "," && depth.length > 0) {
-        // safe truncation point inside the innermost container
-        lastSafe = i;
-        lastSafeDepth = [...depth];
-      }
-    }
-    let trimmed = lastSafe > 0 ? input.slice(0, lastSafe) : input;
-    let closingDepth = lastSafe > 0 ? lastSafeDepth : depth;
-    // close any open containers
-    for (let i = closingDepth.length - 1; i >= 0; i--) {
-      trimmed += closingDepth[i] === "{" ? "}" : "]";
-    }
-    return trimmed;
-  }
-
-  async function claudeJson(systemPrompt: string, userText: string): Promise<any> {
-    const client = new Anthropic();
-    const message = await client.messages.create({
-      model: CLAUDE_MODEL as any,
-      max_tokens: 16000,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userText }],
-    });
-    const text = (message.content || [])
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
-      .join("\n")
-      .trim();
-    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-    // First try direct parse
-    try {
-      return JSON.parse(stripped);
-    } catch {}
-    // Try extracting the outermost {...}
-    const match = stripped.match(/\{[\s\S]*\}/);
-    const candidate = match ? match[0] : stripped;
-    try {
-      return JSON.parse(candidate);
-    } catch (firstErr: any) {
-      // Truncation repair fallback
-      try {
-        const repaired = repairTruncatedJson(candidate);
-        const parsed = JSON.parse(repaired);
-        console.warn("claudeJson: parsed after truncation repair");
-        return parsed;
-      } catch {
-        throw new Error(
-          "Could not parse extracted JSON: " + (firstErr?.message || "unknown error")
-        );
-      }
-    }
-  }
-
-  // Vision-based extraction: send PDF pages as images so Claude can read PDFs
-  // with encoded/CID fonts (Funding Suite, MyFICO exports, scanned PDFs).
-  async function claudeJsonFromImages(systemPrompt: string, userText: string, pages: { base64Png: string }[]): Promise<any> {
-    const client = new Anthropic();
-    const content: any[] = [{ type: "text", text: userText }];
-    for (const p of pages) {
-      content.push({
-        type: "image",
-        source: { type: "base64", media_type: "image/png", data: p.base64Png },
-      });
-    }
-    const message = await client.messages.create({
-      model: CLAUDE_MODEL as any,
-      max_tokens: 16000,
-      system: systemPrompt,
-      messages: [{ role: "user", content }],
-    });
-    const text = (message.content || [])
-      .filter((c: any) => c.type === "text")
-      .map((c: any) => c.text)
-      .join("\n")
-      .trim();
-    const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-    try { return JSON.parse(stripped); } catch {}
-    const match = stripped.match(/\{[\s\S]*\}/);
-    const candidate = match ? match[0] : stripped;
-    try {
-      return JSON.parse(candidate);
-    } catch (firstErr: any) {
-      try {
-        const repaired = repairTruncatedJson(candidate);
-        return JSON.parse(repaired);
-      } catch {
-        throw new Error("Could not parse vision-extracted JSON: " + (firstErr?.message || "unknown"));
-      }
-    }
-  }
-
-  /**
-   * Run an extraction prompt against a PDF. Tries text extraction first (fast,
-   * cheap). If the PDF is image-only or uses encoded fonts (garbled text),
-   * falls back to rendering pages and using vision. Returns parsed JSON.
-   */
-  async function extractFromPdf(
-    base64: string,
-    systemPrompt: string,
-    userTextTemplate: (pdfText: string) => string,
-    visionInstruction: string,
-  ): Promise<{ parsed: any; method: "text" | "vision" }> {
-    const { text: pdfText, error } = await extractPdfText(base64);
-    if (pdfText && !error) {
-      const parsed = await claudeJson(systemPrompt, userTextTemplate(pdfText));
-      return { parsed, method: "text" };
-    }
-    // Text path failed (image-only, encoded fonts, or unreadable). Try vision.
-    console.log(`[extractFromPdf] text path failed (${error || "no text"}), falling back to vision`);
-    let pages;
-    try {
-      pages = await renderPdfToPngs(base64, { maxPages: 12, scale: 1.5 });
-    } catch (e: any) {
-      console.error("[extractFromPdf] PDF render failed:", e);
-      throw new Error(`Vision fallback failed to render PDF: ${e?.message || "unknown error"}. Original text error: ${error || "none"}`);
-    }
-    if (!pages.length) {
-      throw new Error("PDF has no pages to read (vision fallback)");
-    }
-    console.log(`[extractFromPdf] rendered ${pages.length} page(s) for vision extraction`);
-    try {
-      const parsed = await claudeJsonFromImages(systemPrompt, visionInstruction, pages);
-      return { parsed, method: "vision" };
-    } catch (e: any) {
-      console.error("[extractFromPdf] Vision Claude call failed:", e);
-      throw new Error(`Vision extraction failed: ${e?.message || "unknown error"}`);
-    }
-  }
-
-  const CREDIT_REPORT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary, no explanation):
-{
-  "name": string,    // see CRITICAL NAME/ADDRESS RULES below
-  "address": string, // see CRITICAL NAME/ADDRESS RULES below
-  "phone": string|null,
-  "email": string|null,
-  "creditScore": number|null,        // see SCORE RULES below — pick the MIDDLE of the 3 bureau scores (mortgage-qualifying mid-score)
-  "creditScoreSource": string|null,   // which bureau the chosen score came from ("Equifax"|"Experian"|"TransUnion")
-  "bureauScores": { "equifax": number|null, "experian": number|null, "transunion": number|null },
-  "creditCards": [
-    { "cardName": string, "issuer": string, "creditLimit": number, "currentBalance": number, "minimumPayment": number|null, "paymentDueDate": string|null, "accountStatus": "Current"|"Past Due"|"Closed"|"Charged Off" }
-  ],
-  "chargeOffs": [
-    { "creditor": string, "accountType": string, "originalAmount": number, "balance": number, "openedDate": string, "closedDate": string }
-  ],
-  "collections": [
-    { "creditor": string, "originalCreditor": string, "balance": number, "reportedDate": string }
-  ],
-  "latePayments": [
-    { "creditor": string, "accountType": string, "status": "Open"|"Closed", "mostRecentLateDate": string, "lateHistory": string, "withinTwelveMonths": boolean, "monthsSinceLate": number }
-  ],
-  "repossessions": [
-    { "creditor": string, "accountType": string, "originalAmount": number, "balance": number, "openedDate": string, "repoDate": string, "status": string }
-  ],
-  "publicRecords": [
-    { "recordType": "Bankruptcy"|"Judgment"|"Foreclosure"|"Tax Lien"|"Other", "courtOrAgency": string, "referenceNumber": string, "amount": number, "status": string, "filedDate": string }
-  ],
-  "totalAccountsCount": number,
-  "oldestAccount": { "creditor": string, "year": number },
-  "newestAccount": { "creditor": string, "year": number },
-  "avgAccountAge": { "years": number, "months": number }
-}
-SCORE RULES:
-- If the report shows scores from multiple bureaus (Equifax / Experian / TransUnion — common in tri-merge mortgage reports), populate ALL THREE in bureauScores.
-- For the top-level "creditScore" + "creditScoreSource", pick the MIDDLE of the three (mortgage mid-score). If only 2 scores are shown, pick the lower. If only 1 is shown, use it.
-- Score sources commonly appear under headers like "Credit Scores", "FICO Score", "Score Summary", or in a 3-column block at the top of the report.
-
-CRITICAL CHARGE-OFF vs COLLECTION RULES (most common source of errors):
-- A "paid-collection" / "collection" / "placed for collection" / "in collection" → goes in collections[], NOT chargeOffs[].
-- A "charge-off" / "charged off" / "paid-chargeOff" → goes in chargeOffs[], NOT collections[].
-- The status field on each tradeline (e.g. "paid-collection" vs "paid-chargeOff") is the source of truth — read it carefully on each account.
-- Funding Suite mortgage reports list these in the tradeline table with an explicit account status column. NEVER guess based on creditor name alone (e.g. "Cap One" can be either — read its actual status).
-- An account can only appear in ONE of chargeOffs[] or collections[] — never both. The same physical account is not double-counted.
-- chargeOffsCount and collectionsCount on the final summary equal the array lengths — getting the bucket wrong shifts a count by 1.
-
-AVG ACCOUNT AGE RULES:
-- avgAccountAge.years and avgAccountAge.months together describe ONE duration (e.g. 5 years 7 months).
-- months MUST be in 0–11 range. NEVER use 0 months as a default — if you don't know the exact months, estimate from the opened dates of the tradelines you see.
-- If the report doesn't show any opened dates at all, set BOTH years and months to 0 (signals unknown).
-- Otherwise compute: average across all tradelines of (today - openedDate) in months, then split into years + remaining months.
-
-Also include a comprehensive flat list named allAccounts containing EVERY tradeline you see, in this format:
-"allAccounts": [
-  { "creditor": string, "accountType": "Credit Card"|"Auto Loan"|"Mortgage"|"Student Loan"|"Personal Loan"|"Collection"|"Charge-Off"|"Repossession"|"Public Record"|"Other", "status": "Open"|"Closed"|"Paid"|"Current"|"Past Due"|"Charged Off"|"In Collection"|string, "openedYear": number|null, "balance": number|null }
-]
-
-CRITICAL NAME/ADDRESS RULES:
-- Pull "name" and "address" ONLY from the consumer's Personal Information / Personal Profile / Consumer Information / Personal Identifying Information / Consumer Statement section at the top of the report — the section that lists the real consumer's full name, partial DOB, address history, and masked SSN.
-- For "address", use the address marked Current, Primary, or Most Recent. If multiple addresses are listed, pick the one with the most recent reported / on-file date. Format as "STREET, CITY ST ZIP".
-- IGNORE all placeholder, sample, instructional, or merge-template text. Specifically, NEVER use any of these values: FOLLOW ME, FOLLOW ME LATER, SAMPLE, EXAMPLE, TEST, JOHN DOE, JANE DOE, John A. Sample, JOHN Q PUBLIC, JANE SMITH (when on a template), SOMEWHERE STREET, SOMEPLACE, ANYTOWN, ANYWHERE, 12345 (alone), 99999, 123 MAIN ST, 123 ANY STREET, YOUR NAME, YOUR ADDRESS, CLIENT NAME, [NAME], [ADDRESS], CONSUMER NAME, N/A, NONE.
-- NEVER pull the name or address from a dispute-letter template, sample letter, instructions panel, marketing footer, or any section showing how a future letter would look. Those sections often contain placeholder text like FOLLOW ME and SOMEWHERE STREET.
-- NEVER pull the name or address from a creditor's mailing block (e.g. an address shown next to ENHANCED RECOVERY, MIDLAND CREDIT, etc.) — those are creditor addresses, not the consumer's.
-- If the report has no recognizable consumer Personal Information section, OR the only candidates match the placeholders above, return EMPTY STRING ("") for that field rather than guessing.
-
-Extract from the attached credit report PDF. Dates use "YYYY-MM" format. lateHistory is a short summary like "1x60d 1x90d" or "24x90d" describing how many times late and severity. withinTwelveMonths is true if the most recent late payment occurred within the last 12 months from today. monthsSinceLate is the integer number of months between the most recent late date and today (use 0 if unknown). repossessions includes vehicle or asset repossessions — list each one. publicRecords includes bankruptcies, judgments, foreclosures, tax liens; recordType MUST be one of the listed values. For totalAccountsCount: count EVERY tradeline listed on the report — open AND closed/paid accounts, revolving + installment (auto, mortgage, student) + collections + charge-offs + public records. The value MUST equal allAccounts.length. List ALL accounts in their proper category arrays — credit cards (revolving) go in creditCards; auto loans, mortgages, student loans, personal loans go ONLY if they appear as charge-off/repossession/collection — but EVERY account regardless of type must appear in allAccounts. If a field is unknown, use null (or empty string for required strings, 0 for numbers, [] for arrays). For accountStatus, use "Current" by default. Return ONLY the JSON object.`;
-
-  const BANK_STATEMENT_SCHEMA_PROMPT = `You are a JSON-only API. Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
-{
-  "bankName": string|null,
-  "accountHolderName": string|null,
-  "accounts": [
-    { "accountType": "Checking"|"Savings"|"Money Market"|"CD"|"Retirement"|"Business Checking"|"Business Savings"|"Other", "accountName": string, "lastFourDigits": string|null, "endingBalance": number|null, "averageBalance": number|null, "openedDate": string|null }
-  ],
-  "statementPeriod": { "start": string|null, "end": string|null },
-  "hasSavings": boolean,
-  "hasRetirement": boolean,
-  "isBusinessAccount": boolean,
-  "businessClassificationReason": string,
-  "totalDeposits": number|null,
-  "totalWithdrawals": number|null,
-  "notes": string|null
-}
-Extract from the attached bank statement text. Dates use "YYYY-MM" format. hasSavings = true if any account is Savings/Money Market/CD. hasRetirement = true only if a retirement/401k/IRA account is shown.
-
-CRITICAL FOR isBusinessAccount: classify based on the ACCOUNT HOLDER NAME on the statement, NOT the product name. Set isBusinessAccount=true ONLY if the account holder name contains a business entity suffix (LLC, L.L.C., Inc, Inc., Corp, Corporation, Ltd, LP, LLP, PLLC, Company, Co., Holdings, Trust, Foundation, DBA, or is clearly a non-person entity name). If the account holder is a natural person's name (e.g. "JOHN A SMITH", "TAMARA GUERRERO"), set isBusinessAccount=false EVEN IF the product is called "Business Checking" or similar. Some people open business-named products for personal use — the holder name is the ground truth. In businessClassificationReason, briefly explain (e.g. "holder name is 'TAMARA GUERRERO' — a personal name" or "holder name contains 'LLC'").
-
-If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
-
-  // ====== Endpoints ======
-
-  // Server-side safety net: strip out known placeholder values that some
-  // credit-report templates contain (dispute-letter samples, instructional
-  // panels). If the LLM still grabbed one of these despite the prompt,
-  // blank it out so the user can fill it in via Edit instead of seeing junk.
-  const NAME_PLACEHOLDER_PATTERNS: RegExp[] = [
-    /\bfollow\s*me( later)?\b/i,
-    /\b(sample|example|test)\b/i,
-    /\bjohn\s+doe\b/i,
-    /\bjane\s+doe\b/i,
-    /\bjohn\s+q\.?\s+public\b/i,
-    /\byour\s+name\b/i,
-    /\bclient\s+name\b/i,
-    /\bconsumer\s+name\b/i,
-    /^\s*\[?(name|address)\]?\s*$/i,
-    /^\s*n\/?a\s*$/i,
-    /^\s*none\s*$/i,
-  ];
-  const ADDR_PLACEHOLDER_PATTERNS: RegExp[] = [
-    /\bsomewhere\s+(street|st|drive|dr|ave|avenue|road|rd)\b/i,
-    /\bsomeplace\b/i,
-    /\banytown\b/i,
-    /\banywhere\b/i,
-    /\byour\s+address\b/i,
-    /\b123\s+main\s+st(reet)?\b/i,
-    /\b123\s+any\s+(street|st)\b/i,
-    /^\s*\[?address\]?\s*$/i,
-    /\b12345\b.*\b(somewhere|someplace|anytown|anywhere)\b/i,
-    /^\s*n\/?a\s*$/i,
-  ];
-  function sanitizePlaceholder(value: string | null | undefined, patterns: RegExp[]): string {
-    if (!value) return "";
-    const v = String(value).trim();
-    if (!v) return "";
-    for (const p of patterns) if (p.test(v)) return "";
-    return v;
-  }
-
-  // Best-effort: derive a real name from the uploaded PDF's filename when
-  // the LLM gave us a placeholder. We use the consultant's own naming
-  // convention: "<First Last> - CR (MM-DD-YY).pdf" or "<First Last> CR ...".
-  function deriveNameFromFilename(fileName?: string): string {
-    if (!fileName) return "";
-    let base = fileName.replace(/\.[a-zA-Z0-9]+$/, ""); // strip extension
-    // Strip anything from " - CR" / " CR " / parens onward
-    base = base.split(/\s+-\s+CR\b|\s+CR\b|\(/i)[0];
-    base = base.replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
-    // Must look like a person's name: 2-4 words, alpha-only
-    if (!/^[A-Za-z][A-Za-z.'\- ]{2,60}$/.test(base)) return "";
-    const parts = base.split(" ").filter(Boolean);
-    if (parts.length < 2 || parts.length > 4) return "";
-    // Title-case each part
-    return parts
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-      .join(" ");
-  }
-
-  // Extract client data from a credit-report PDF (used by Add Client flow)
+  // Extract client data from a credit-report PDF (New Client flow). Not saved.
   app.post("/api/extract-credit-report", async (req: Request, res: Response) => {
+    const body = extractBody.safeParse(req.body);
+    if (!body.success) return zodError(res, body.error);
+    const { fileBase64, fileName } = body.data;
     try {
-      const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
-      if (!fileBase64) return res.status(400).json({ message: "Missing fileBase64" });
-      const { parsed, method } = await extractFromPdf(
-        fileBase64,
-        CREDIT_REPORT_SCHEMA_PROMPT,
-        (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
-        `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
-      );
-      console.log(`[extract-credit-report] method=${method} fileName=${fileName || "(none)"}`);
-      // Strip known placeholders
-      const cleanName = sanitizePlaceholder(parsed?.name, NAME_PLACEHOLDER_PATTERNS);
-      const cleanAddress = sanitizePlaceholder(parsed?.address, ADDR_PLACEHOLDER_PATTERNS);
-      // If name came back empty after stripping, try to derive from filename
-      const fallbackName = cleanName || deriveNameFromFilename(fileName);
-      parsed.name = fallbackName;
-      parsed.address = cleanAddress;
-      res.json({ extracted: parsed, fileName: fileName || "credit-report.pdf" });
+      const { parsed, method, warnings } = await extractCreditReport(fileBase64);
+      console.log(`[extract-credit-report] method=${method} warnings=${warnings.length}`);
+      // Name came back empty or as a placeholder: fall back to the consultant's file naming.
+      if (!parsed.name) parsed.name = deriveNameFromFilename(fileName);
+      res.json({ extracted: parsed, method, warnings, fileName: fileName || "credit-report.pdf" });
     } catch (e: any) {
-      console.error("Extract error:", e);
+      console.error("Extract error:", e?.message || e);
       res.status(500).json({ message: e?.message || "Extraction failed" });
     }
   });
 
-  // ====== Field-label registry for the review modal ======
-  const FIELD_LABELS: Record<string, { label: string; section: string; format?: "number" | "text" | "bool" | "money" | "percent" }> = {
-    recentCreditReport: { label: "Credit Score", section: "Credit Report", format: "text" },
-    equifaxScore: { label: "Equifax Score", section: "Credit Report", format: "number" },
-    experianScore: { label: "Experian Score", section: "Credit Report", format: "number" },
-    transunionScore: { label: "TransUnion Score", section: "Credit Report", format: "number" },
-    totalAccountsCount: { label: "Accounts Found", section: "Credit Report", format: "number" },
-    creditUtilization: { label: "Credit Utilization", section: "Credit Report", format: "percent" },
-    chargeOffsCount: { label: "Charge-Offs", section: "Credit Report", format: "number" },
-    collectionsCount: { label: "Collections", section: "Credit Report", format: "number" },
-    repossessionsCount: { label: "Repossessions", section: "Credit Report", format: "number" },
-    publicRecordsCount: { label: "Public Records", section: "Credit Report", format: "number" },
-    latePaymentsCount: { label: "Late Payments (total)", section: "Credit Report", format: "number" },
-    latePaymentsWithin12moCount: { label: "Late — within 12mo", section: "Credit Report", format: "number" },
-    latePayments12to24moCount: { label: "Late — 12–24mo", section: "Credit Report", format: "number" },
-    latePaymentsOlder24moCount: { label: "Late — over 24mo", section: "Credit Report", format: "number" },
-    oldestAccountCreditor: { label: "Oldest Account Creditor", section: "Credit Report", format: "text" },
-    oldestAccountYear: { label: "Oldest Account Year", section: "Credit Report", format: "number" },
-    newestAccountCreditor: { label: "Newest Account Creditor", section: "Credit Report", format: "text" },
-    newestAccountYear: { label: "Newest Account Year", section: "Credit Report", format: "number" },
-    avgAccountAgeYears: { label: "Avg Account Age (years)", section: "Credit Report", format: "number" },
-    avgAccountAgeMonths: { label: "Avg Account Age (months)", section: "Credit Report", format: "number" },
-    creditAnalysisDate: { label: "Credit Analysis Date", section: "Credit Report", format: "text" },
-    // Tables (treated as one row each in the review modal)
-    __cards: { label: "Credit Cards (replace all)", section: "Credit Report", format: "text" },
-    __chargeOffs: { label: "Charge-Offs (replace all)", section: "Credit Report", format: "text" },
-    __collections: { label: "Collections (replace all)", section: "Credit Report", format: "text" },
-    __latePayments: { label: "Late Payments (replace all)", section: "Credit Report", format: "text" },
-    __repossessions: { label: "Repossessions (replace all)", section: "Credit Report", format: "text" },
-    __publicRecords: { label: "Public Records (replace all)", section: "Credit Report", format: "text" },
-    // Bank fields
-    numBankAccounts: { label: "# Personal Bank Accounts", section: "Banking", format: "number" },
-    bankAccountsList: { label: "Personal Bank Accounts", section: "Banking", format: "text" },
-    hasSavings: { label: "Has Savings", section: "Banking", format: "bool" },
-    hasRetirement401k: { label: "Has Retirement / 401k", section: "Banking", format: "bool" },
-    hasBusinessAccounts: { label: "Has Business Accounts", section: "Banking", format: "bool" },
-    businessAccountsList: { label: "Business Bank Accounts", section: "Banking", format: "text" },
-  };
-
-  // Build the credit-report patch + parsed payload
-  async function buildCreditReportPatch(parsed: any) {
-    const patch: any = {};
-    // Prefer the tri-bureau breakdown when available (mortgage tri-merge reports)
-    const b = parsed.bureauScores || {};
-    const triParts: string[] = [];
-    if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
-    if (b.experian != null) triParts.push(`Experian ${b.experian}`);
-    if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
-    if (b.equifax != null) patch.equifaxScore = b.equifax;
-    if (b.experian != null) patch.experianScore = b.experian;
-    if (b.transunion != null) patch.transunionScore = b.transunion;
-    if (triParts.length >= 2) {
-      patch.recentCreditReport = triParts.join(", ");
-    } else if (parsed.creditScore != null && parsed.creditScoreSource) {
-      patch.recentCreditReport = `${parsed.creditScore} (${parsed.creditScoreSource})`;
-    } else if (parsed.creditScore != null) {
-      patch.recentCreditReport = String(parsed.creditScore);
-    }
-    if (parsed.totalAccountsCount != null) patch.totalAccountsCount = Number(parsed.totalAccountsCount) || 0;
-    if (parsed.oldestAccount) {
-      patch.oldestAccountCreditor = parsed.oldestAccount.creditor || "";
-      patch.oldestAccountYear = Number(parsed.oldestAccount.year) || 0;
-    }
-    if (parsed.newestAccount) {
-      patch.newestAccountCreditor = parsed.newestAccount.creditor || "";
-      patch.newestAccountYear = Number(parsed.newestAccount.year) || 0;
-    }
-    if (parsed.avgAccountAge) {
-      patch.avgAccountAgeYears = Number(parsed.avgAccountAge.years) || 0;
-      patch.avgAccountAgeMonths = Number(parsed.avgAccountAge.months) || 0;
-    }
-    patch.chargeOffsCount = (parsed.chargeOffs || []).length;
-    patch.collectionsCount = (parsed.collections || []).length;
-    patch.repossessionsCount = (parsed.repossessions || []).length;
-    patch.publicRecordsCount = (parsed.publicRecords || []).length;
-    const lp = (parsed.latePayments || []) as any[];
-    patch.latePaymentsCount = lp.length;
-    patch.latePaymentsWithin12moCount = lp.filter((l) => l.withinTwelveMonths || (l.monthsSinceLate != null && l.monthsSinceLate <= 12)).length;
-    patch.latePayments12to24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 12 && l.monthsSinceLate <= 24).length;
-    patch.latePaymentsOlder24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 24).length;
-    const cards = (parsed.creditCards || []) as any[];
-    const totalLimit = cards.reduce((s, c) => s + (Number(c.creditLimit) || 0), 0);
-    const totalBal = cards.reduce((s, c) => s + (Number(c.currentBalance) || 0), 0);
-    if (totalLimit > 0) patch.creditUtilization = Math.round((totalBal / totalLimit) * 100);
-    patch.creditAnalysisDate = new Date().toISOString().slice(0, 10);
-    return patch;
-  }
-
-  function buildBankPatch(parsed: any) {
-    const accounts = (parsed.accounts || []) as any[];
-    const isBiz = !!parsed.isBusinessAccount;
-    const patch: any = {};
-    if (isBiz) {
-      patch.hasBusinessAccounts = true;
-      patch.businessAccountsList = accounts.map((a) => a.accountName || a.accountType).filter(Boolean).join(", ");
-    } else {
-      patch.numBankAccounts = accounts.length;
-      patch.bankAccountsList = accounts.map((a) => `${a.accountName || a.accountType}${a.lastFourDigits ? ` (…${a.lastFourDigits})` : ""}`).join(", ");
-      if (typeof parsed.hasSavings === "boolean") patch.hasSavings = parsed.hasSavings;
-      if (typeof parsed.hasRetirement === "boolean") patch.hasRetirement401k = parsed.hasRetirement;
-    }
-    return { patch, isBiz, accounts };
-  }
-
-  function diffPatch(current: any, patch: any) {
-    // Return [{ key, label, section, format, currentValue, proposedValue, changed }]
-    const out: any[] = [];
-    for (const key of Object.keys(patch)) {
-      const meta = FIELD_LABELS[key];
-      if (!meta) continue;
-      const cur = (current as any)[key];
-      const next = patch[key];
-      const changed = String(cur ?? "") !== String(next ?? "");
-      out.push({ key, label: meta.label, section: meta.section, format: meta.format || "text", currentValue: cur, proposedValue: next, changed });
-    }
-    return out;
-  }
-
-  // PREVIEW: re-extract from latest files, return proposed changes without writing
+  // PREVIEW: re-extract from the latest stored files; return a diff without writing.
   app.post("/api/clients/:id/preview-from-files", async (req: Request, res: Response) => {
-    const clientId = Number(req.params.id);
-    if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    const clientId = parseId(req.params.id);
+    if (!clientId) return res.status(400).json({ message: "Invalid id" });
     const client = await storage.getClient(clientId);
     if (!client) return res.status(404).json({ message: "Client not found" });
 
-    const allFiles = client.files || [];
-    const latestOf = (type: string) => {
-      const list = allFiles.filter((f: any) => f.fileType === type);
-      if (list.length === 0) return undefined;
-      return list.sort((a: any, b: any) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""))[0];
-    };
+    const latestOf = (type: string) =>
+      client.files
+        .filter((f) => f.fileType === type)
+        .sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""))[0];
     const latestCreditReport = latestOf("credit_report");
     const latestBankStatement = latestOf("bank_statement");
 
@@ -541,67 +162,65 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
       return res.status(400).json({ message: "No credit report or bank statement uploaded yet. Upload a PDF first, then click Update again." });
     }
 
-    const out: any = { errors: [], creditReport: null, bankStatement: null };
+    const out: any = { errors: [], warnings: [], creditReport: null, bankStatement: null };
 
     if (latestCreditReport) {
       try {
-        const fullFile = await storage.getFile(latestCreditReport.id);
-        const base64 = (fullFile as any)?.base64Content;
-        if (!base64) throw new Error("Credit report file has no content stored");
-        const { parsed, method } = await extractFromPdf(
-          base64,
-          CREDIT_REPORT_SCHEMA_PROMPT,
-          (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
-          `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
-        );
-        console.log(`[preview-credit-report] method=${method} fileName=${latestCreditReport.fileName}`);
-        const patch = await buildCreditReportPatch(parsed);
+        const file = await storage.getFile(latestCreditReport.id);
+        if (!file?.base64Content) throw new Error("Credit report file has no content stored");
+        const { parsed, method, warnings } = await extractCreditReport(file.base64Content);
+        console.log(`[preview-credit-report] method=${method} warnings=${warnings.length}`);
+        out.warnings.push(...warnings.map((w) => `Credit report: ${w}`));
+        const patch = buildCreditReportPatch(parsed);
         const fieldDiffs = diffPatch(client, patch);
-        // Table-level diffs: just count comparisons
-        const tableDiffs: any[] = [];
-        const tableSpecs: Array<[string, string, any[], number]> = [
-          ["__cards", "Credit Cards (replace all)", parsed.creditCards || [], (client as any).creditCards?.length || 0],
-          ["__chargeOffs", "Charge-Offs (replace all)", parsed.chargeOffs || [], (client as any).chargeOffs?.length || 0],
-          ["__collections", "Collections (replace all)", parsed.collections || [], (client as any).collections?.length || 0],
-          ["__latePayments", "Late Payments (replace all)", parsed.latePayments || [], (client as any).latePayments?.length || 0],
-          ["__repossessions", "Repossessions (replace all)", parsed.repossessions || [], (client as any).repossessions?.length || 0],
-          ["__publicRecords", "Public Records (replace all)", parsed.publicRecords || [], (client as any).publicRecords?.length || 0],
+
+        const [cos, cols, lates, repos, prs] = await Promise.all([
+          storage.listChargeOffs(clientId),
+          storage.listCollections(clientId),
+          storage.listLatePayments(clientId),
+          storage.listRepossessions(clientId),
+          storage.listPublicRecords(clientId),
+        ]);
+        const tableSpecs: Array<[string, any[], number]> = [
+          ["__cards", parsed.creditCards, client.creditCards.length],
+          ["__chargeOffs", parsed.chargeOffs, cos.length],
+          ["__collections", parsed.collections, cols.length],
+          ["__latePayments", parsed.latePayments, lates.length],
+          ["__repossessions", parsed.repossessions, repos.length],
+          ["__publicRecords", parsed.publicRecords, prs.length],
         ];
-        for (const [key, label, newList, currentCount] of tableSpecs) {
-          tableDiffs.push({
-            key, label, section: "Credit Report", format: "text",
-            currentValue: `${currentCount} item${currentCount === 1 ? "" : "s"}`,
-            proposedValue: `${newList.length} item${newList.length === 1 ? "" : "s"}`,
-            changed: currentCount !== newList.length || newList.length > 0,
-          });
-        }
+        const plural = (n: number) => `${n} item${n === 1 ? "" : "s"}`;
+        const tableDiffs: Diff[] = tableSpecs.map(([key, list, currentCount]) => ({
+          key,
+          label: FIELD_LABELS[key].label,
+          section: "Credit Report",
+          format: "text",
+          currentValue: plural(currentCount),
+          proposedValue: plural(list.length),
+          // Same count can still mean different rows, so any non-empty table is offered.
+          changed: currentCount !== list.length || list.length > 0,
+        }));
         out.creditReport = {
           fileName: latestCreditReport.fileName,
           fileId: latestCreditReport.id,
           diffs: [...fieldDiffs, ...tableDiffs],
           allAccounts: parsed.allAccounts || [],
-          parsed, // store full parsed payload so apply doesn't re-run Claude
+          parsed, // full payload so apply doesn't re-run the AI
         };
       } catch (e: any) {
-        console.error("Credit report preview error:", e);
+        console.error("Credit report preview error:", e?.message || e);
         out.errors.push(`Credit report (${latestCreditReport.fileName}): ${e?.message || "failed"}`);
       }
     }
 
     if (latestBankStatement) {
       try {
-        const fullFile = await storage.getFile(latestBankStatement.id);
-        const base64 = (fullFile as any)?.base64Content;
-        if (!base64) throw new Error("Bank statement file has no content stored");
-        const { parsed, method } = await extractFromPdf(
-          base64,
-          BANK_STATEMENT_SCHEMA_PROMPT,
-          (pdfText) => `Extract bank account info from this statement text. Return ONLY the JSON object per the schema.\n\n--- BANK STATEMENT TEXT ---\n${pdfText}\n--- END ---`,
-          `Extract bank account info from this statement. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
-        );
-        console.log(`[preview-bank-statement] method=${method} fileName=${latestBankStatement.fileName}`);
+        const file = await storage.getFile(latestBankStatement.id);
+        if (!file?.base64Content) throw new Error("Bank statement file has no content stored");
+        const { parsed, method, warnings } = await extractBankStatement(file.base64Content);
+        console.log(`[preview-bank-statement] method=${method} warnings=${warnings.length}`);
+        out.warnings.push(...warnings.map((w) => `Bank statement: ${w}`));
         const { patch, isBiz, accounts } = buildBankPatch(parsed);
-        const diffs = diffPatch(client, patch);
         out.bankStatement = {
           fileName: latestBankStatement.fileName,
           fileId: latestBankStatement.id,
@@ -611,11 +230,11 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
           businessClassificationReason: parsed.businessClassificationReason || null,
           accountsFound: accounts.length,
           accounts,
-          diffs,
+          diffs: diffPatch(client, patch),
           parsed,
         };
       } catch (e: any) {
-        console.error("Bank statement preview error:", e);
+        console.error("Bank statement preview error:", e?.message || e);
         out.errors.push(`Bank statement (${latestBankStatement.fileName}): ${e?.message || "failed"}`);
       }
     }
@@ -623,181 +242,96 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     res.json(out);
   });
 
-  // APPLY: receive selected fields + parsed payloads, write to DB
+  // APPLY: write only the fields and tables the user accepted, in one transaction.
   app.post("/api/clients/:id/apply-from-files", async (req: Request, res: Response) => {
-    const clientId = Number(req.params.id);
-    if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    const clientId = parseId(req.params.id);
+    if (!clientId) return res.status(400).json({ message: "Invalid id" });
+    const body = applyBody.safeParse(req.body);
+    if (!body.success) return zodError(res, body.error);
     const client = await storage.getClient(clientId);
     if (!client) return res.status(404).json({ message: "Client not found" });
 
-    const { acceptedKeys, creditReportParsed, bankStatementParsed } = req.body as {
-      acceptedKeys: string[];
-      creditReportParsed?: any;
-      bankStatementParsed?: any;
-    };
-    if (!Array.isArray(acceptedKeys)) return res.status(400).json({ message: "acceptedKeys required" });
-    const accept = new Set(acceptedKeys);
+    const accept = new Set(body.data.acceptedKeys);
+    const patch: Record<string, any> = {};
+    const tables: Parameters<typeof storage.applyExtraction>[2] = {};
 
-    // Credit report scalar patch
-    if (creditReportParsed) {
-      const fullPatch = await buildCreditReportPatch(creditReportParsed);
-      const filtered: any = {};
-      for (const k of Object.keys(fullPatch)) if (accept.has(k)) filtered[k] = fullPatch[k];
-      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
-
-      // Table replacements: only if user accepted that table
-      if (accept.has("__cards")) {
-        await storage.replaceCards(clientId, (creditReportParsed.creditCards || []).map((c: any) => ({
-          cardName: c.cardName || "", issuer: c.issuer || "",
-          creditLimit: Number(c.creditLimit) || 0, currentBalance: Number(c.currentBalance) || 0,
-          minimumPayment: c.minimumPayment != null ? Number(c.minimumPayment) : null,
-          paymentDueDate: c.paymentDueDate || "", accountStatus: c.accountStatus || "Current", notes: "",
-        })));
+    if (body.data.creditReportParsed) {
+      const parsed = normalizeCreditReport(body.data.creditReportParsed);
+      const full = buildCreditReportPatch(parsed);
+      for (const k of Object.keys(full)) if (accept.has(k)) patch[k] = full[k];
+      const rows = toChildTables(parsed);
+      // A replaced table always brings its summary count(s) along, so the
+      // KPI cards can never disagree with the rows underneath them.
+      const tableCounts: Array<[string, keyof typeof rows, string[]]> = [
+        ["__cards", "creditCards", ["creditUtilization"]],
+        ["__chargeOffs", "chargeOffs", ["chargeOffsCount"]],
+        ["__collections", "collections", ["collectionsCount"]],
+        ["__latePayments", "latePayments", ["latePaymentsCount", "latePaymentsWithin12moCount", "latePayments12to24moCount", "latePaymentsOlder24moCount"]],
+        ["__repossessions", "repossessions", ["repossessionsCount"]],
+        ["__publicRecords", "publicRecords", ["publicRecordsCount"]],
+      ];
+      for (const [key, table, countKeys] of tableCounts) {
+        if (!accept.has(key)) continue;
+        (tables as any)[table] = rows[table];
+        for (const k of countKeys) if (k in full) patch[k] = full[k];
       }
-      if (accept.has("__chargeOffs")) {
-        await storage.replaceChargeOffs(clientId, (creditReportParsed.chargeOffs || []).map((c: any) => ({
-          creditor: c.creditor || "", accountType: c.accountType || "",
-          originalAmount: Number(c.originalAmount) || 0, balance: Number(c.balance) || 0,
-          openedDate: c.openedDate || "", closedDate: c.closedDate || "", notes: "",
-        })));
-      }
-      if (accept.has("__collections")) {
-        await storage.replaceCollections(clientId, (creditReportParsed.collections || []).map((c: any) => ({
-          creditor: c.creditor || "", originalCreditor: c.originalCreditor || "",
-          balance: Number(c.balance) || 0, reportedDate: c.reportedDate || "", notes: "",
-        })));
-      }
-      if (accept.has("__latePayments")) {
-        await storage.replaceLatePayments(clientId, (creditReportParsed.latePayments || []).map((l: any) => ({
-          creditor: l.creditor || "", accountType: l.accountType || "",
-          status: l.status || "Open", mostRecentLateDate: l.mostRecentLateDate || "",
-          lateHistory: l.lateHistory || "",
-          withinTwelveMonths: !!l.withinTwelveMonths,
-          monthsSinceLate: Number(l.monthsSinceLate) || 0,
-        })));
-      }
-      if (accept.has("__repossessions")) {
-        await storage.replaceRepossessions(clientId, (creditReportParsed.repossessions || []).map((r: any) => ({
-          creditor: r.creditor || "", accountType: r.accountType || "",
-          originalAmount: Number(r.originalAmount) || 0, balance: Number(r.balance) || 0,
-          openedDate: r.openedDate || "", repoDate: r.repoDate || "",
-          status: r.status || "", notes: "",
-        })));
-      }
-      if (accept.has("__publicRecords")) {
-        await storage.replacePublicRecords(clientId, (creditReportParsed.publicRecords || []).map((p: any) => ({
-          recordType: (p.recordType || "Other"),
-          courtOrAgency: p.courtOrAgency || "", referenceNumber: p.referenceNumber || "",
-          amount: Number(p.amount) || 0, status: p.status || "",
-          filedDate: p.filedDate || "", notes: "",
-        })));
+      // Rebuild the score summary from the scores the client will actually have.
+      if (["equifaxScore", "experianScore", "transunionScore", "recentCreditReport"].some((k) => k in patch)) {
+        const pick = (k: "equifaxScore" | "experianScore" | "transunionScore") => (k in patch ? patch[k] : client[k]);
+        const tri = formatBureauScores(pick("equifaxScore"), pick("experianScore"), pick("transunionScore"));
+        if (tri) patch.recentCreditReport = tri;
       }
     }
 
-    if (bankStatementParsed) {
-      const { patch } = buildBankPatch(bankStatementParsed);
-      const filtered: any = {};
-      for (const k of Object.keys(patch)) if (accept.has(k)) filtered[k] = patch[k];
-      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
+    if (body.data.bankStatementParsed) {
+      const { patch: bankPatch } = buildBankPatch(body.data.bankStatementParsed);
+      for (const k of Object.keys(bankPatch)) if (accept.has(k)) patch[k] = bankPatch[k];
     }
 
-    const refreshed = await storage.getClient(clientId);
-    res.json({ ok: true, client: refreshed });
+    const validPatch = updateClientSchema.safeParse(patch);
+    if (!validPatch.success) return zodError(res, validPatch.error);
+    storage.applyExtraction(clientId, validPatch.data, tables);
+
+    res.json({ ok: true, client: await storage.getClient(clientId) });
   });
 
+  // Dashboard list: each client with its cards (needed for the readiness score).
   app.get("/api/clients", async (_req: Request, res: Response) => {
-    const list = await storage.listClients();
-    res.json(list);
+    res.json(await storage.listClientsWithCards());
   });
 
   app.get("/api/clients/:id", async (req: Request, res: Response) => {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid id" });
     const client = await storage.getClient(id);
     if (!client) return res.status(404).json({ message: "Not found" });
     res.json(client);
   });
 
+  // Create a client, optionally with extracted cards and derogatory tables (atomic).
   app.post("/api/clients", async (req: Request, res: Response) => {
-    try {
-      // Allow optional credit-analysis sub-arrays in the same payload
-      const { chargeOffs: incomingChargeOffs, collections: incomingCollections, latePayments: incomingLatePayments, repossessions: incomingRepossessions, publicRecords: incomingPublicRecords, ...clientFields } = (req.body || {}) as any;
-      const data = insertClientSchema.parse(clientFields);
-      const created = await storage.createClient(data);
-      if (Array.isArray(incomingChargeOffs)) {
-        for (const c of incomingChargeOffs) {
-          await storage.addChargeOff(created.id, {
-            creditor: c.creditor || "",
-            accountType: c.accountType || "",
-            originalAmount: Number(c.originalAmount) || 0,
-            balance: Number(c.balance) || 0,
-            openedDate: c.openedDate || "",
-            closedDate: c.closedDate || "",
-            notes: c.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingCollections)) {
-        for (const c of incomingCollections) {
-          await storage.addCollection(created.id, {
-            creditor: c.creditor || "",
-            originalCreditor: c.originalCreditor || "",
-            balance: Number(c.balance) || 0,
-            reportedDate: c.reportedDate || "",
-            notes: c.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingLatePayments)) {
-        for (const l of incomingLatePayments) {
-          await storage.addLatePayment(created.id, {
-            creditor: l.creditor || "",
-            accountType: l.accountType || "",
-            status: l.status || "Open",
-            mostRecentLateDate: l.mostRecentLateDate || "",
-            lateHistory: l.lateHistory || "",
-            withinTwelveMonths: !!l.withinTwelveMonths,
-            monthsSinceLate: Number(l.monthsSinceLate) || 0,
-          } as any);
-        }
-      }
-      if (Array.isArray(incomingRepossessions)) {
-        for (const r of incomingRepossessions) {
-          await storage.addRepossession(created.id, {
-            creditor: r.creditor || "",
-            accountType: r.accountType || "",
-            originalAmount: Number(r.originalAmount) || 0,
-            balance: Number(r.balance) || 0,
-            openedDate: r.openedDate || "",
-            repoDate: r.repoDate || "",
-            status: r.status || "",
-            notes: r.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingPublicRecords)) {
-        for (const p of incomingPublicRecords) {
-          await storage.addPublicRecord(created.id, {
-            recordType: (p.recordType || "Other") as any,
-            courtOrAgency: p.courtOrAgency || "",
-            referenceNumber: p.referenceNumber || "",
-            amount: Number(p.amount) || 0,
-            status: p.status || "",
-            filedDate: p.filedDate || "",
-            notes: p.notes || "",
-          });
-        }
-      }
-      res.status(201).json(created);
-    } catch (e: any) {
-      if (e instanceof z.ZodError) return res.status(400).json({ message: "Invalid", errors: e.errors });
-      throw e;
-    }
+    const children = z.object(childArrays).safeParse(req.body || {});
+    if (!children.success) return zodError(res, children.error);
+    const { creditCards, chargeOffs, collections, latePayments, repossessions, publicRecords, ...clientFields } =
+      (req.body || {}) as Record<string, any>;
+    const data = insertClientSchema.safeParse(clientFields);
+    if (!data.success) return zodError(res, data.error);
+
+    const rows = toChildTables({ creditCards, chargeOffs, collections, latePayments, repossessions, publicRecords });
+    const created = storage.createClientWithChildren(data.data, {
+      creditCards: creditCards ? rows.creditCards : undefined,
+      chargeOffs: chargeOffs ? rows.chargeOffs : undefined,
+      collections: collections ? rows.collections : undefined,
+      latePayments: latePayments ? rows.latePayments : undefined,
+      repossessions: repossessions ? rows.repossessions : undefined,
+      publicRecords: publicRecords ? rows.publicRecords : undefined,
+    });
+    res.status(201).json(created);
   });
 
   app.get("/api/clients/:id/credit-analysis", async (req: Request, res: Response) => {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ message: "Invalid id" });
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid id" });
     const client = await storage.getClient(id);
     if (!client) return res.status(404).json({ message: "Not found" });
     const [chargeOffs, collections, latePayments, repossessions, publicRecords] = await Promise.all([
@@ -836,6 +370,7 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
   app.post("/api/clients/:id/cards", async (req: Request, res: Response) => {
     const clientId = Number(req.params.id);
     if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    if (!(await storage.getClient(clientId))) return res.status(404).json({ message: "Client not found" });
     try {
       const data = insertCreditCardSchema.omit({ clientId: true }).parse(req.body);
       const created = await storage.addCard(clientId, data);
@@ -871,6 +406,7 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
   app.post("/api/clients/:id/files", async (req: Request, res: Response) => {
     const clientId = Number(req.params.id);
     if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    if (!(await storage.getClient(clientId))) return res.status(404).json({ message: "Client not found" });
     try {
       const data = insertUploadedFileSchema.omit({ clientId: true }).parse(req.body);
       const created = await storage.addFile(clientId, data);
@@ -901,3 +437,4 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
 
   return httpServer;
 }
+

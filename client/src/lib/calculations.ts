@@ -1,4 +1,8 @@
-import type { Client, CreditCard, ClientWithDetails } from "@shared/schema";
+import type { Client, CreditCard } from "@shared/schema";
+import { midScore } from "@shared/creditLogic";
+
+/** Anything with a client row plus its cards (dashboard rows and full profiles). */
+type ClientWithCardList = Client & { creditCards: CreditCard[] };
 
 export type RevenueStatus = "None" | "Starting" | "Growing" | "Strong";
 export type UtilStatus = "Excellent" | "Good" | "Caution" | "Critical";
@@ -33,8 +37,13 @@ export function strengthLabel(score: number): "Weak" | "Fair" | "Strong" {
   return "Weak";
 }
 
+/** Open cards count toward utilization; Closed and Charged Off cards do not. */
+export function isOpenCard(card: Pick<CreditCard, "accountStatus">): boolean {
+  return card.accountStatus !== "Closed" && card.accountStatus !== "Charged Off";
+}
+
 export function overallUtilization(cards: CreditCard[]): number {
-  const activeCards = cards.filter(c => c.accountStatus !== "Closed" && c.accountStatus !== "Charged Off");
+  const activeCards = cards.filter(isOpenCard);
   const totalLimit = activeCards.reduce((s, c) => s + (c.creditLimit || 0), 0);
   const totalBal = activeCards.reduce((s, c) => s + (c.currentBalance || 0), 0);
   if (totalLimit <= 0) return 0;
@@ -55,9 +64,11 @@ export function utilizationScore(utilPct: number): number {
   return 0;
 }
 
+// Exactly 30% meets the 30% target, so it counts as "Good" (matches the ≤30 amber
+// card bucket and the "over 30%" paydown step).
 export function utilizationStatus(utilPct: number): UtilStatus {
   if (utilPct < 10) return "Excellent";
-  if (utilPct < 30) return "Good";
+  if (utilPct <= 30) return "Good";
   if (utilPct < 50) return "Caution";
   return "Critical";
 }
@@ -131,7 +142,101 @@ export function parseMissingDocs(json: string): string[] {
   }
 }
 
-export function fundingReadinessScore(client: ClientWithDetails): number {
+const UTIL_STATUSES: UtilStatus[] = ["Excellent", "Good", "Caution", "Critical"];
+const REVENUE_STATUSES: RevenueStatus[] = ["None", "Starting", "Growing", "Strong"];
+
+/** Utilization status, honoring the manual override when one is set. */
+export function effectiveUtilizationStatus(client: Pick<Client, "creditUtilizationStatusOverride">, utilPct: number): UtilStatus {
+  const o = client.creditUtilizationStatusOverride as UtilStatus | null;
+  return o && UTIL_STATUSES.includes(o) ? o : utilizationStatus(utilPct);
+}
+
+/** Revenue status, honoring the manual override when one is set. */
+export function effectiveRevenueStatus(client: Pick<Client, "businessRevenueStatusOverride" | "monthlyRevenue">): RevenueStatus {
+  const o = client.businessRevenueStatusOverride as RevenueStatus | null;
+  return o && REVENUE_STATUSES.includes(o) ? o : businessRevenueStatus(client.monthlyRevenue);
+}
+
+// ---- Credit quality gate ----
+/** Mid-score a client needs before they can be shown as "Funding Ready". */
+export const MIN_FUNDING_MID_SCORE = 680;
+/** Highest readiness score a client with a credit blocker can get (just under "Funding Ready"). */
+export const CREDIT_BLOCKED_MAX_SCORE = 79;
+
+type CreditFields = Pick<
+  Client,
+  | "equifaxScore"
+  | "experianScore"
+  | "transunionScore"
+  | "chargeOffsCount"
+  | "collectionsCount"
+  | "repossessionsCount"
+  | "publicRecordsCount"
+  | "latePaymentsWithin12moCount"
+>;
+
+export function clientMidScore(client: Pick<Client, "equifaxScore" | "experianScore" | "transunionScore">): number | null {
+  return midScore([client.equifaxScore, client.experianScore, client.transunionScore]);
+}
+
+export type CreditBlocker = { key: string; text: string; step: string };
+
+/** Reasons this client's credit keeps them from being "Funding Ready". */
+export function creditBlockers(client: CreditFields): CreditBlocker[] {
+  const out: CreditBlocker[] = [];
+  const mid = clientMidScore(client);
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  if (mid != null && mid < MIN_FUNDING_MID_SCORE) {
+    out.push({
+      key: "score",
+      text: `Mid credit score ${mid} is below ${MIN_FUNDING_MID_SCORE}`,
+      step: `Raise the mid credit score to ${MIN_FUNDING_MID_SCORE}+ before applying for funding.`,
+    });
+  }
+  if (client.chargeOffsCount > 0) {
+    out.push({
+      key: "chargeOffs",
+      text: `${plural(client.chargeOffsCount, "charge-off", "charge-offs")} on report`,
+      step: "Resolve or dispute charge-offs on the credit report.",
+    });
+  }
+  if (client.collectionsCount > 0) {
+    out.push({
+      key: "collections",
+      text: `${plural(client.collectionsCount, "collection", "collections")} on report`,
+      step: "Resolve or dispute collection accounts on the credit report.",
+    });
+  }
+  if (client.repossessionsCount > 0) {
+    out.push({
+      key: "repossessions",
+      text: `${plural(client.repossessionsCount, "repossession", "repossessions")} on report`,
+      step: "Address repossessions on the credit report.",
+    });
+  }
+  if (client.publicRecordsCount > 0) {
+    out.push({
+      key: "publicRecords",
+      text: `${plural(client.publicRecordsCount, "public record", "public records")} on report`,
+      step: "Address public records (bankruptcy, judgment, lien) on the credit report.",
+    });
+  }
+  if (client.latePaymentsWithin12moCount > 0) {
+    out.push({
+      key: "recentLates",
+      text: `${plural(client.latePaymentsWithin12moCount, "late payment", "late payments")} in the last 12 months`,
+      step: "Keep every account paid on time; recent late payments block most funding.",
+    });
+  }
+  return out;
+}
+
+/**
+ * Funding Readiness (0–100). Override wins. Otherwise the average of the four
+ * components minus missing-document deductions — and capped at 79 ("Almost
+ * Ready") while any credit blocker exists.
+ */
+export function fundingReadinessScore(client: ClientWithCardList): number {
   if (client.fundingReadinessScoreOverride != null) return clamp(client.fundingReadinessScoreOverride, 0, 100);
   const util = overallUtilization(client.creditCards);
   const pb = personalBankingStrength(client);
@@ -141,7 +246,9 @@ export function fundingReadinessScore(client: ClientWithDetails): number {
   const base = 0.25 * pb + 0.25 * bb + 0.25 * us + 0.25 * br;
   const missing = parseMissingDocs(client.missingDocuments);
   const deduction = Math.min(20, missing.length * 5);
-  return clamp(Math.round(base - deduction), 0, 100);
+  let score = clamp(Math.round(base - deduction), 0, 100);
+  if (creditBlockers(client).length > 0) score = Math.min(score, CREDIT_BLOCKED_MAX_SCORE);
+  return score;
 }
 
 export function readinessLabel(score: number): { label: string; color: string } {
@@ -150,11 +257,13 @@ export function readinessLabel(score: number): { label: string; color: string } 
   return { label: "Not Ready", color: "hsl(0 72% 51%)" };
 }
 
-export function autoRecommendedSteps(client: ClientWithDetails): string[] {
+export function autoRecommendedSteps(client: ClientWithCardList): string[] {
   const steps: string[] = [];
   const util = overallUtilization(client.creditCards);
   const missing = parseMissingDocs(client.missingDocuments);
   const score = fundingReadinessScore(client);
+
+  for (const b of creditBlockers(client)) steps.push(b.step);
 
   if (util > 50) steps.push("URGENT: High utilization — prioritize paying down credit card balances immediately.");
   else if (util > 30) steps.push("Pay down credit cards to bring overall utilization under 30%.");
@@ -173,14 +282,17 @@ export function autoRecommendedSteps(client: ClientWithDetails): string[] {
 
 export type Flag = { kind: "red" | "amber" | "green"; text: string };
 
-export function autoFlags(client: ClientWithDetails): Flag[] {
+export function autoFlags(client: ClientWithCardList): Flag[] {
   const flags: Flag[] = [];
   const util = overallUtilization(client.creditCards);
   const missing = parseMissingDocs(client.missingDocuments);
   const score = fundingReadinessScore(client);
 
+  for (const b of creditBlockers(client)) flags.push({ kind: "red", text: b.text });
+  if (clientMidScore(client) == null) flags.push({ kind: "amber", text: "No credit scores on file" });
+
   if (util > 50) flags.push({ kind: "red", text: "High credit utilization (>50%)" });
-  else if (util >= 30) flags.push({ kind: "amber", text: "Moderate utilization (30–50%)" });
+  else if (util > 30) flags.push({ kind: "amber", text: "Moderate utilization (30–50%)" });
 
   if (client.lastUpdated) {
     const last = new Date(client.lastUpdated).getTime();

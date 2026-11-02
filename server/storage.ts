@@ -9,6 +9,8 @@ import type {
   UploadedFile,
   InsertUploadedFile,
   ClientWithDetails,
+  ClientWithCards,
+  UploadedFileMeta,
   ChargeOff,
   InsertChargeOff,
   Collection,
@@ -241,6 +243,7 @@ export const db = drizzle(sqlite);
 
 export interface IStorage {
   listClients(): Promise<Client[]>;
+  listClientsWithCards(): Promise<ClientWithCards[]>;
   getClient(id: number): Promise<ClientWithDetails | undefined>;
   createClient(data: InsertClient): Promise<Client>;
   updateClient(id: number, data: UpdateClient): Promise<Client | undefined>;
@@ -275,12 +278,39 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(clients).all();
   }
 
+  async listClientsWithCards(): Promise<ClientWithCards[]> {
+    const all = db.select().from(clients).all();
+    const cards = db.select().from(creditCards).all();
+    const byClient = new Map<number, CreditCard[]>();
+    for (const c of cards) {
+      const list = byClient.get(c.clientId) ?? [];
+      list.push(c);
+      byClient.set(c.clientId, list);
+    }
+    return all.map((c) => ({ ...c, creditCards: byClient.get(c.id) ?? [] }));
+  }
+
   async getClient(id: number): Promise<ClientWithDetails | undefined> {
     const client = db.select().from(clients).where(eq(clients.id, id)).get();
     if (!client) return undefined;
     const cards = db.select().from(creditCards).where(eq(creditCards.clientId, id)).all();
-    const files = db.select().from(uploadedFiles).where(eq(uploadedFiles.clientId, id)).all();
-    return { ...client, creditCards: cards, files };
+    return { ...client, creditCards: cards, files: this.listFileMeta(id) };
+  }
+
+  /** File rows WITHOUT base64Content. Fetch one file's content with getFile(). */
+  listFileMeta(clientId: number): UploadedFileMeta[] {
+    return db
+      .select({
+        id: uploadedFiles.id,
+        clientId: uploadedFiles.clientId,
+        fileName: uploadedFiles.fileName,
+        fileType: uploadedFiles.fileType,
+        uploadedAt: uploadedFiles.uploadedAt,
+        fileSize: uploadedFiles.fileSize,
+      })
+      .from(uploadedFiles)
+      .where(eq(uploadedFiles.clientId, clientId))
+      .all();
   }
 
   async createClient(data: InsertClient): Promise<Client> {
@@ -399,12 +429,75 @@ export class DatabaseStorage implements IStorage {
     db.delete(publicRecords).where(eq(publicRecords.clientId, clientId)).run();
     for (const it of items) db.insert(publicRecords).values({ ...it, clientId } as any).run();
   }
+
+  /** Create a client plus its cards and derogatory rows atomically. */
+  createClientWithChildren(data: InsertClient, tables: ChildTables): Client {
+    return sqlite.transaction(() => {
+      const created = db
+        .insert(clients)
+        .values({ ...data, lastUpdated: nowIso() } as any)
+        .returning()
+        .get();
+      writeChildTables(created.id, tables, false);
+      return created;
+    })();
+  }
+
+  /**
+   * Apply an accepted extraction: patch the client row and replace only the
+   * tables present in `tables`, all in one transaction.
+   */
+  applyExtraction(clientId: number, patch: UpdateClient, tables: ChildTables): void {
+    sqlite.transaction(() => {
+      db.update(clients)
+        .set({ ...patch, lastUpdated: nowIso() } as any)
+        .where(eq(clients.id, clientId))
+        .run();
+      writeChildTables(clientId, tables, true);
+    })();
+  }
+}
+
+export type ChildTables = {
+  creditCards?: Array<Omit<InsertCreditCard, "clientId">>;
+  chargeOffs?: Array<Omit<InsertChargeOff, "clientId">>;
+  collections?: Array<Omit<InsertCollection, "clientId">>;
+  latePayments?: Array<Omit<InsertLatePayment, "clientId">>;
+  repossessions?: Array<Omit<InsertRepossession, "clientId">>;
+  publicRecords?: Array<Omit<InsertPublicRecord, "clientId">>;
+};
+
+// Synchronous so it can run inside a better-sqlite3 transaction.
+function writeChildTables(clientId: number, tables: ChildTables, replace: boolean) {
+  const specs: Array<[keyof ChildTables, any]> = [
+    ["creditCards", creditCards],
+    ["chargeOffs", chargeOffs],
+    ["collections", collections],
+    ["latePayments", latePayments],
+    ["repossessions", repossessions],
+    ["publicRecords", publicRecords],
+  ];
+  for (const [key, table] of specs) {
+    const rows = tables[key];
+    if (!rows) continue;
+    if (replace) db.delete(table).where(eq(table.clientId, clientId)).run();
+    for (const row of rows) db.insert(table).values({ ...row, clientId } as any).run();
+  }
 }
 
 export const storage = new DatabaseStorage();
 
 // Seed sample data
+/**
+ * Sample clients for local development only. Never runs in production unless
+ * SEED_SAMPLE_DATA=true is set explicitly — otherwise a fresh (or emptied)
+ * production database would show made-up clients.
+ */
 export async function seedIfEmpty() {
+  const isProd = process.env.NODE_ENV === "production";
+  const flag = (process.env.SEED_SAMPLE_DATA || "").toLowerCase();
+  const enabled = flag === "true" || (!isProd && flag !== "false");
+  if (!enabled) return;
   const existing = await storage.listClients();
   if (existing.length > 0) return;
 

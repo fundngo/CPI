@@ -8,15 +8,15 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Search, Plus, ArrowUpRight, Users, TrendingUp, CheckCircle2, Clock } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/StatusBadge";
-import type { Client, ClientStatus } from "@shared/schema";
+import type { ClientWithCards, ClientStatus } from "@shared/schema";
 import { CLIENT_STATUSES } from "@shared/schema";
-import { fmtDate, readinessLabel } from "@/lib/calculations";
+import { fmtDate, fundingReadinessScore, readinessLabel } from "@/lib/calculations";
 
 export default function Dashboard() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
 
-  const { data: clients = [], isLoading } = useQuery<Client[]>({
+  const { data: clients = [], isLoading } = useQuery<ClientWithCards[]>({
     queryKey: ["/api/clients"],
   });
 
@@ -150,8 +150,8 @@ export default function Dashboard() {
                 </tr>
               )}
               {filtered.map((client) => {
-                // Use cached creditUtilization (not exact since cards aren't loaded here)
-                const score = client.fundingReadinessScoreOverride ?? estimateScore(client);
+                // Same calculation as the profile and PDF (the list includes each client's cards).
+                const score = fundingReadinessScore(client);
                 const { label, color } = readinessLabel(score);
                 return (
                   <tr key={client.id} className="border-t border-slate-200 hover:bg-slate-50 transition-colors" data-testid={`row-client-${client.id}`}>
@@ -212,43 +212,4 @@ function StatCard({ icon, label, value, testId }: { icon: React.ReactNode; label
       <div className="mt-3 text-3xl font-bold tabular-nums text-card-foreground" data-testid={testId}>{value}</div>
     </Card>
   );
-}
-
-// Rough score estimate without cards (uses cached util %)
-function estimateScore(c: Client): number {
-  let pb = 0;
-  if (c.numBankAccounts >= 4) pb = 80;
-  else if (c.numBankAccounts === 3) pb = 60;
-  else if (c.numBankAccounts === 2) pb = 40;
-  else if (c.numBankAccounts === 1) pb = 20;
-  if (c.hasSavings) pb += 10;
-  if (c.hasRetirement401k) pb += 10;
-  pb = Math.min(100, pb);
-
-  let bb = 0;
-  if (c.activeLLC) bb += 20;
-  if (c.hasBusinessAccounts) bb += 20;
-  if (c.generatingRevenue) bb += 30;
-  if (c.hasBusinessProducts) bb += 15;
-  if (c.gettingOffersInMail) bb += 15;
-
-  const util = c.creditUtilization || 0;
-  let us = 0;
-  if (util < 10) us = 100;
-  else if (util < 20) us = 85;
-  else if (util < 30) us = 70;
-  else if (util < 50) us = 50;
-  else if (util < 75) us = 25;
-
-  const m = c.monthlyRevenue || 0;
-  let br = 0;
-  if (m >= 50000) br = 100;
-  else if (m >= 20000) br = 85;
-  else if (m >= 5000) br = 60;
-  else if (m >= 1) br = 30;
-
-  let missing = 0;
-  try { const arr = JSON.parse(c.missingDocuments || "[]"); if (Array.isArray(arr)) missing = arr.length; } catch {}
-  const deduction = Math.min(20, missing * 5);
-  return Math.max(0, Math.min(100, Math.round(0.25 * pb + 0.25 * bb + 0.25 * us + 0.25 * br - deduction)));
 }

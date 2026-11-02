@@ -8,20 +8,8 @@ import { createServer } from "node:http";
 const app = express();
 const httpServer = createServer(app);
 
-declare module "http" {
-  interface IncomingMessage {
-    rawBody: unknown;
-  }
-}
-
-app.use(
-  express.json({
-    limit: "50mb",
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
-);
+// Large limit for base64 PDF uploads (a 30MB PDF is ~40MB as base64).
+app.use(express.json({ limit: "50mb" }));
 
 app.use(express.urlencoded({ extended: false, limit: "50mb" }));
 
@@ -36,29 +24,17 @@ export function log(message: string, source = "express") {
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
+// Request log: method, path, status and timing only. Response bodies are never
+// logged — they contain client PII (names, addresses, credit data) and, for
+// file routes, entire base64-encoded PDFs.
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
-
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
-
   res.on("finish", () => {
-    const duration = Date.now() - start;
     if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      log(logLine);
+      log(`${req.method} ${path} ${res.statusCode} in ${Date.now() - start}ms`);
     }
   });
-
   next();
 });
 

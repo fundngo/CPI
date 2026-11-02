@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { bucketLatePayments } from "@shared/creditLogic";
 import {
   TrendingDown,
   AlertTriangle,
@@ -84,18 +85,13 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
   } = data;
 
   // 3-bucket split for late payments
-  const within12 = latePayments.filter((lp) => lp.withinTwelveMonths);
-  const between12And24 = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate > 0 && lp.monthsSinceLate <= 24
-  );
-  const older = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate > 24
-  );
-  // Catch any late payments not flagged within12 but with no monthsSinceLate set
-  const uncategorized = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate === 0
-  );
-  const olderCombined = [...older, ...uncategorized];
+  // One shared bucketing rule (date first, then the extractor's flag) so these
+  // tables match the summary counts and the PDF.
+  const lateBuckets = bucketLatePayments(latePayments);
+  const within12 = lateBuckets.within12;
+  const between12And24 = lateBuckets["12to24"];
+  const olderCombined = lateBuckets.over24;
+  const lateUnknown = lateBuckets.unknown;
 
   const hasAny =
     chargeOffs.length > 0 ||
@@ -373,6 +369,14 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
             rows={olderCombined}
             testId="table-late-older-24"
           />
+        </div>
+      )}
+
+      {/* Late Payments — no usable date on the report */}
+      {lateUnknown.length > 0 && (
+        <div data-testid="section-late-unknown">
+          <SectionHeading title="Late Payments — Date Not Reported" count={lateUnknown.length} />
+          <CreditTable columns={lateCols} rows={lateUnknown} testId="table-late-unknown" />
         </div>
       )}
 

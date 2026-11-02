@@ -57,6 +57,10 @@ See [`.env.example`](./.env.example).
 | `PORT`              | no       | Defaults to 5000. Railway sets this automatically.               |
 | `DATABASE_PATH`     | no       | Defaults to `./data.db`. Set to `/data/data.db` on Railway.      |
 | `NODE_ENV`          | no       | Set to `production` on Railway.                                  |
+| `CLAUDE_MODEL`      | no       | Extraction model. Defaults to `claude-opus-5-5`.                 |
+| `CLAUDE_EFFORT`     | no       | `low`–`max`. Blank = model default.                              |
+| `VISION_MAX_PAGES`  | no       | Pages read in image mode (default 40, max 100).                  |
+| `SEED_SAMPLE_DATA`  | no       | Sample clients: on in local dev, never in production unless `true`. |
 
 ---
 
@@ -66,3 +70,10 @@ See [`.env.example`](./.env.example).
 - `npm run build` — production build (client to `dist/public`, server to `dist/index.cjs`)
 - `npm start` — run production build
 - `npm run check` — TypeScript check
+- `npm test` — unit tests for scoring and credit-report logic
+
+## Scoring notes
+
+- **Funding Readiness** = average of personal banking, business banking, utilization and revenue scores, minus 5 per missing document (max 20). A client can't reach **Funding Ready (80+)** while their mid credit score is under 680 or the report shows charge-offs, collections, repossessions, public records, or late payments in the last 12 months; the score is capped at 79 and each reason appears as a red flag and a next step. A manual override still wins.
+- **Late payments** are bucketed by the reported date of the most recent late (within 12 / 12–24 / over 24 months). Items with no usable date are shown separately as "Date not reported" instead of being guessed.
+- **Utilization** and all totals count open cards only; Closed and Charged Off cards are listed but excluded.

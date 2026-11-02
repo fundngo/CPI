@@ -1,4 +1,4 @@
-// Render a PDF (as base64) to one PNG per page using poppler-utils' `pdftoppm`.
+// Render a PDF (as base64) to one JPEG per page using poppler-utils' `pdftoppm`.
 //
 // Why a subprocess instead of pdfjs + node-canvas?
 // - pdfjs-dist + @napi-rs/canvas crashes on credit-report PDFs with
@@ -14,40 +14,71 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export type PdfPagePng = { pageNumber: number; base64Png: string; bytes: number };
+export type PdfPageImage = {
+  pageNumber: number;
+  base64: string;
+  mediaType: "image/jpeg";
+  bytes: number;
+};
 
-function runPdftoppm(args: string[]): Promise<void> {
+function run(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("pdftoppm", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
     let stderr = "";
+    child.stdout.on("data", (b) => (stdout += b.toString()));
     child.stderr.on("data", (b) => (stderr += b.toString()));
     child.on("error", reject);
     child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`pdftoppm exited ${code}: ${stderr.trim() || "(no stderr)"}`));
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${cmd} exited ${code}: ${stderr.trim() || "(no stderr)"}`));
     });
   });
 }
 
-export async function renderPdfToPngs(
-  pdfBase64: string,
-  opts: { maxPages?: number; scale?: number } = {}
-): Promise<PdfPagePng[]> {
+function decode(pdfBase64: string): Buffer {
   const cleaned = pdfBase64.includes(",") ? pdfBase64.split(",")[1] : pdfBase64;
-  const pdfBuffer = Buffer.from(cleaned, "base64");
-  const maxPages = opts.maxPages ?? 12;
-  // pdftoppm uses -r <dpi>. 150dpi = great for vision OCR, ~1.7M pixels at letter.
-  const scale = opts.scale ?? 1.5;
-  const dpi = Math.round(72 * scale * 1.4); // ~150dpi at scale 1.5
+  return Buffer.from(cleaned, "base64");
+}
 
+async function withTempPdf<T>(pdfBase64: string, fn: (dir: string, pdfPath: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "cpi-pdf-"));
   const pdfPath = join(dir, "input.pdf");
-  const prefix = join(dir, "page");
-
   try {
-    await writeFile(pdfPath, pdfBuffer);
-    await runPdftoppm([
-      "-png",
+    await writeFile(pdfPath, decode(pdfBase64));
+    return await fn(dir, pdfPath);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** Total page count via poppler's `pdfinfo`. */
+export async function countPdfPages(pdfBase64: string): Promise<number | null> {
+  return withTempPdf(pdfBase64, async (_dir, pdfPath) => {
+    const out = await run("pdfinfo", [pdfPath]);
+    const m = out.match(/^Pages:\s+(\d+)/m);
+    return m ? parseInt(m[1], 10) : null;
+  });
+}
+
+/**
+ * Render up to `maxPages` pages to JPEG (~150 dpi). JPEG keeps text legible
+ * for the vision model at a fraction of PNG's size, which lets long reports
+ * fit in one request. Stops early once `maxTotalBytes` would be exceeded.
+ */
+export async function renderPdfToImages(
+  pdfBase64: string,
+  opts: { maxPages?: number; dpi?: number; maxTotalBytes?: number } = {},
+): Promise<PdfPageImage[]> {
+  const maxPages = opts.maxPages ?? 40;
+  const dpi = opts.dpi ?? 150;
+  const maxTotalBytes = opts.maxTotalBytes ?? 20 * 1024 * 1024;
+
+  return withTempPdf(pdfBase64, async (dir, pdfPath) => {
+    const prefix = join(dir, "page");
+    await run("pdftoppm", [
+      "-jpeg",
+      "-jpegopt", "quality=85",
       "-r", String(dpi),
       "-f", "1",
       "-l", String(maxPages),
@@ -55,27 +86,22 @@ export async function renderPdfToPngs(
       prefix,
     ]);
 
+    // pdftoppm zero-pads page numbers when there are many pages; sort numerically.
     const files = (await readdir(dir))
-      .filter((f) => f.startsWith("page-") && f.endsWith(".png"))
-      .sort(); // page-1.png, page-2.png, ... page-10.png lexicographic ok up to 99
+      .map((f) => ({ f, m: f.match(/^page-(\d+)\.jpg$/) }))
+      .filter((x) => x.m)
+      .map((x) => ({ f: x.f, pageNumber: parseInt(x.m![1], 10) }))
+      .sort((a, b) => a.pageNumber - b.pageNumber);
 
-    const out: PdfPagePng[] = [];
-    for (const f of files) {
-      // Extract page number from "page-N.png" — pdftoppm zero-pads when there are
-      // many pages, so just parse the int.
-      const m = f.match(/page-(\d+)\.png$/);
-      const pageNumber = m ? parseInt(m[1], 10) : out.length + 1;
+    const out: PdfPageImage[] = [];
+    let total = 0;
+    for (const { f, pageNumber } of files) {
       const buf = await readFile(join(dir, f));
-      out.push({
-        pageNumber,
-        base64Png: buf.toString("base64"),
-        bytes: buf.byteLength,
-      });
+      const b64 = buf.toString("base64");
+      if (out.length > 0 && total + b64.length > maxTotalBytes) break;
+      total += b64.length;
+      out.push({ pageNumber, base64: b64, mediaType: "image/jpeg", bytes: buf.byteLength });
     }
-    // Sort numerically just in case
-    out.sort((a, b) => a.pageNumber - b.pageNumber);
     return out;
-  } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
-  }
+  });
 }

@@ -239,9 +239,17 @@ export type InsertRepossession = z.infer<typeof insertRepossessionSchema>;
 export type PublicRecord = typeof publicRecords.$inferSelect;
 export type InsertPublicRecord = z.infer<typeof insertPublicRecordSchema>;
 
+/** File row without its (large) base64 payload — what list/profile endpoints return. */
+export type UploadedFileMeta = Omit<UploadedFile, "base64Content">;
+
+/** Dashboard row: a client plus its cards (enough to compute readiness). */
+export type ClientWithCards = Client & {
+  creditCards: CreditCard[];
+};
+
 export type ClientWithDetails = Client & {
   creditCards: CreditCard[];
-  files: UploadedFile[];
+  files: UploadedFileMeta[];
 };
 
 export type CreditAnalysis = {

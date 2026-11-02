@@ -8,7 +8,7 @@
     "startCommand": "node dist/index.cjs",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
-    "healthcheckPath": "/api/clients",
+    "healthcheckPath": "/api/health",
     "healthcheckTimeout": 30
   }
 }

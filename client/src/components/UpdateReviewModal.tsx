@@ -34,6 +34,7 @@ type Account = {
 
 type PreviewData = {
   errors: string[];
+  warnings?: string[];
   creditReport?: {
     fileName: string;
     diffs: Diff[];
@@ -261,6 +262,23 @@ export function UpdateReviewModal({
                   </ul>
                 </AlertDescription>
               </Alert>
+            )}
+
+            {preview?.warnings && preview.warnings.length > 0 && (
+              <div
+                className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900"
+                data-testid="review-warnings"
+              >
+                <div className="flex items-center gap-2 font-semibold mb-1">
+                  <AlertTriangle className="h-4 w-4" />
+                  Check before applying
+                </div>
+                <ul className="list-disc pl-5 space-y-1">
+                  {preview.warnings.map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                </ul>
+              </div>
             )}
 
             {cr && (

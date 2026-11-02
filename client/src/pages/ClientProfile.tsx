@@ -1,3 +1,4 @@
+import { formatBureauScores } from "@shared/creditLogic";
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation, useRoute } from "wouter";
@@ -47,7 +48,8 @@ import {
   autoFlags,
   autoRecommendedSteps,
   businessBankingStrength,
-  businessRevenueStatus,
+  effectiveRevenueStatus,
+  effectiveUtilizationStatus,
   fmtDate,
   fundingReadinessScore,
   overallUtilization,
@@ -100,8 +102,8 @@ export default function ClientProfile() {
   const score = fundingReadinessScore(client);
   const flags = autoFlags(client);
   const autoSteps = autoRecommendedSteps(client);
-  const revStatus = businessRevenueStatus(client.monthlyRevenue);
-  const utilStat = utilizationStatus(util);
+  const revStatus = effectiveRevenueStatus(client);
+  const utilStat = effectiveUtilizationStatus(client, util);
 
   return (
     <div className="px-6 sm:px-10 py-10 max-w-5xl mx-auto pb-28">
@@ -312,14 +314,10 @@ export default function ClientProfile() {
             <ReadOnlyField label="Age of Bank Accounts" value={client.bankAccountsAge} />
             <ReadOnlyField
               label="Recent Credit Report"
-              value={(() => {
-                const parts: string[] = [];
-                if (client.equifaxScore != null) parts.push(`Equifax ${client.equifaxScore}`);
-                if (client.experianScore != null) parts.push(`Experian ${client.experianScore}`);
-                if (client.transunionScore != null) parts.push(`TransUnion ${client.transunionScore}`);
-                if (parts.length > 0) return parts.join(", ");
-                return client.recentCreditReport;
-              })()}
+              value={
+                formatBureauScores(client.equifaxScore, client.experianScore, client.transunionScore) ||
+                client.recentCreditReport
+              }
             />
             <ReadOnlyBool label="Has Savings Account" value={client.hasSavings} />
             <ReadOnlyBool label="Has Retirement / 401(k)" value={client.hasRetirement401k} />
@@ -365,7 +363,7 @@ export default function ClientProfile() {
           testId="section-cards"
         >
           <div className="pt-2">
-            <CreditCardsSection cards={client.creditCards} />
+            <CreditCardsSection cards={client.creditCards} utilStatusOverride={client.creditUtilizationStatusOverride} />
           </div>
         </SectionCard>
 

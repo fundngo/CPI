@@ -19,10 +19,9 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { useState } from "react";
 import { UpdateReviewModal } from "@/components/UpdateReviewModal";
 import { FILE_TYPES } from "@shared/schema";
-import type { FileType, UploadedFile } from "@shared/schema";
+import type { FileType, UploadedFileMeta } from "@shared/schema";
 import { fmtDate } from "@/lib/calculations";
 
 const TYPE_LABELS: Record<FileType, string> = {
@@ -59,7 +58,7 @@ function fmtSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-export function FilesSection({ clientId, files }: { clientId: number; files: UploadedFile[] }) {
+export function FilesSection({ clientId, files }: { clientId: number; files: UploadedFileMeta[] }) {
   const { toast } = useToast();
   const [uploading, setUploading] = useState(false);
   const [pendingType, setPendingType] = useState<FileType>("other");
@@ -133,21 +132,30 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop });
 
-  async function handleDownload(file: UploadedFile) {
+  async function handleDownload(file: UploadedFileMeta) {
     try {
       const res = await apiRequest("GET", `/api/files/${file.id}`);
       const full = await res.json();
+      // Older intake uploads were stored as a full data: URL; strip any prefix.
+      const raw: string = String(full.base64Content || "");
+      const b64 = raw.includes(",") ? raw.slice(raw.indexOf(",") + 1) : raw;
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const type = /\.pdf$/i.test(full.fileName) ? "application/pdf" : "application/octet-stream";
+      const url = URL.createObjectURL(new Blob([bytes], { type }));
       const link = document.createElement("a");
-      link.href = `data:application/octet-stream;base64,${full.base64Content}`;
+      link.href = url;
       link.download = full.fileName;
       link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
     } catch (e: any) {
       toast({ title: "Download failed", description: e.message, variant: "destructive" });
     }
   }
 
   // Group files
-  const groups: Record<FileType, UploadedFile[]> = {
+  const groups: Record<FileType, UploadedFileMeta[]> = {
     credit_report: [],
     bank_statement: [],
     business_doc: [],
@@ -204,7 +212,7 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
       </div>
 
       <div className="space-y-4">
-        {(Object.entries(groups) as [FileType, UploadedFile[]][])
+        {(Object.entries(groups) as [FileType, UploadedFileMeta[]][])
           .filter(([, list]) => list.length > 0)
           .map(([type, list]) => {
             const Icon = TYPE_ICONS[type];

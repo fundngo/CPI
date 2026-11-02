@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { formatBureauScores } from "@shared/creditLogic";
+import { parseMissingDocs } from "@/lib/calculations";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation, useRoute } from "wouter";
 import { Button } from "@/components/ui/button";
@@ -38,12 +40,14 @@ export default function EditClient() {
   const [form, setForm] = useState<EditableClient>({});
   const [cards, setCards] = useState<EditableCard[]>([]);
   const [removedCardIds, setRemovedCardIds] = useState<number[]>([]);
+  const [missingDocsText, setMissingDocsText] = useState("");
 
   useEffect(() => {
     if (client) {
       setForm({ ...client });
       setCards(client.creditCards.map((c) => ({ ...c })));
       setRemovedCardIds([]);
+      setMissingDocsText(parseMissingDocs(client.missingDocuments).join("\n"));
     }
   }, [client]);
 
@@ -120,7 +124,16 @@ export default function EditClient() {
         "businessNotes",
         "internalNotes",
         "recommendedNextSteps",
+        "fundingReadinessScoreOverride",
+        "personalBankingStrengthOverride",
+        "businessBankingStrengthOverride",
+        "creditUtilizationStatusOverride",
+        "businessRevenueStatusOverride",
       ];
+      // One document per line → JSON array (blank lines ignored).
+      clientPayload.missingDocuments = JSON.stringify(
+        missingDocsText.split("\n").map((l) => l.trim()).filter(Boolean),
+      );
       for (const k of fields) {
         if (form[k] !== undefined) clientPayload[k as string] = form[k];
       }
@@ -128,12 +141,9 @@ export default function EditClient() {
       const eq = form.equifaxScore;
       const ex = form.experianScore;
       const tu = form.transunionScore;
-      const triParts: string[] = [];
-      if (eq != null && eq !== 0) triParts.push(`Equifax ${eq}`);
-      if (ex != null && ex !== 0) triParts.push(`Experian ${ex}`);
-      if (tu != null && tu !== 0) triParts.push(`TransUnion ${tu}`);
-      if (triParts.length > 0 && !form.recentCreditReport?.trim()) {
-        clientPayload.recentCreditReport = triParts.join(", ");
+      const tri = formatBureauScores(eq, ex, tu);
+      if (tri && !form.recentCreditReport?.trim()) {
+        clientPayload.recentCreditReport = tri;
       }
       await apiRequest("PATCH", `/api/clients/${id}`, clientPayload);
 
@@ -643,6 +653,57 @@ export default function EditClient() {
                 data-testid="input-edit-internal-notes"
               />
             </FormField>
+            <FormField label="Missing Documents (one per line · each lowers readiness by 5)">
+              <Textarea
+                rows={3}
+                value={missingDocsText}
+                onChange={(e) => setMissingDocsText(e.target.value)}
+                placeholder={"e.g. Last 3 months bank statements\nPhoto ID"}
+                data-testid="input-edit-missing-docs"
+              />
+            </FormField>
+          </div>
+        </SectionCard>
+
+        {/* Overrides */}
+        <SectionCard title="Summary Overrides" testId="section-edit-overrides">
+          <p className="text-sm text-muted-foreground pt-2">
+            Leave blank to use the automatic calculation. A value here replaces the calculated one everywhere,
+            including the PDF.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3">
+            <OverrideNumber
+              label="Funding Readiness (0–100)"
+              value={form.fundingReadinessScoreOverride ?? null}
+              onChange={(v) => update("fundingReadinessScoreOverride", v)}
+              testId="input-override-readiness"
+            />
+            <OverrideNumber
+              label="Personal Banking (0–100)"
+              value={form.personalBankingStrengthOverride ?? null}
+              onChange={(v) => update("personalBankingStrengthOverride", v)}
+              testId="input-override-personal"
+            />
+            <OverrideNumber
+              label="Business Banking (0–100)"
+              value={form.businessBankingStrengthOverride ?? null}
+              onChange={(v) => update("businessBankingStrengthOverride", v)}
+              testId="input-override-business"
+            />
+            <OverrideSelect
+              label="Utilization Status"
+              value={form.creditUtilizationStatusOverride ?? null}
+              options={["Excellent", "Good", "Caution", "Critical"]}
+              onChange={(v) => update("creditUtilizationStatusOverride", v)}
+              testId="select-override-util"
+            />
+            <OverrideSelect
+              label="Revenue Status"
+              value={form.businessRevenueStatusOverride ?? null}
+              options={["None", "Starting", "Growing", "Strong"]}
+              onChange={(v) => update("businessRevenueStatusOverride", v)}
+              testId="select-override-revenue"
+            />
           </div>
         </SectionCard>
 
@@ -710,5 +771,68 @@ function CheckboxRow({
       />
       <span className="text-sm text-card-foreground">{label}</span>
     </label>
+  );
+}
+
+function OverrideNumber({
+  label,
+  value,
+  onChange,
+  testId,
+}: {
+  label: string;
+  value: number | null;
+  onChange: (v: number | null) => void;
+  testId?: string;
+}) {
+  return (
+    <FormField label={label}>
+      <Input
+        type="number"
+        min={0}
+        max={100}
+        value={value ?? ""}
+        placeholder="Auto"
+        onChange={(e) => {
+          const raw = e.target.value;
+          if (raw === "") return onChange(null);
+          const n = Math.round(Number(raw));
+          onChange(Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null);
+        }}
+        data-testid={testId}
+      />
+    </FormField>
+  );
+}
+
+function OverrideSelect({
+  label,
+  value,
+  options,
+  onChange,
+  testId,
+}: {
+  label: string;
+  value: string | null;
+  options: string[];
+  onChange: (v: string | null) => void;
+  testId?: string;
+}) {
+  return (
+    <FormField label={label}>
+      <Select value={value ?? "__auto"} onValueChange={(v) => onChange(v === "__auto" ? null : v)}>
+        <SelectTrigger data-testid={testId}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__auto">Auto</SelectItem>
+          {options.map((o) => (
+            <SelectItem key={o} value={o}>
+              {o}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </FormField>
   );
 }

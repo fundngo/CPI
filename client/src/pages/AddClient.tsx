@@ -6,8 +6,13 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { Input } from "@/components/ui/input";
 import type { Client } from "@shared/schema";
-import { ArrowLeft, UploadCloud, Loader2, FileText, AlertCircle, CheckCircle2 } from "lucide-react";
+import { formatBureauScores, lateBucketCounts, midScore, validScore } from "@shared/creditLogic";
+import { ArrowLeft, UploadCloud, Loader2, FileText, AlertCircle, CheckCircle2, AlertTriangle } from "lucide-react";
+
+// Express accepts 50MB of JSON; base64 adds ~33%, so cap the PDF itself at 35MB.
+const MAX_PDF_BYTES = 35 * 1024 * 1024;
 
 interface ExtractedCard {
   cardName: string;
@@ -71,6 +76,7 @@ interface ExtractedData {
   email: string | null;
   creditScore: number | null;
   creditScoreSource: string | null;
+  bureauScores?: { equifax: number | null; experian: number | null; transunion: number | null };
   creditCards: ExtractedCard[];
   chargeOffs?: ExtractedChargeOff[];
   collections?: ExtractedCollection[];
@@ -93,6 +99,7 @@ export default function AddClient() {
   const [pdfBase64, setPdfBase64] = useState<string>("");
   const [fileName, setFileName] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   const fileToBase64 = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
@@ -110,9 +117,14 @@ export default function AddClient() {
         toast({ title: "PDF only", description: "Please upload a .pdf file.", variant: "destructive" });
         return;
       }
+      if (file.size > MAX_PDF_BYTES) {
+        toast({ title: "File too large", description: "Please upload a PDF under 35 MB.", variant: "destructive" });
+        return;
+      }
       setFileName(file.name);
       setStage("extracting");
       setErrorMsg("");
+      setWarnings([]);
       try {
         const dataUrl = await fileToBase64(file);
         setPdfBase64(dataUrl);
@@ -125,6 +137,7 @@ export default function AddClient() {
           throw new Error("No data returned");
         }
         setExtracted(json.extracted as ExtractedData);
+        setWarnings(Array.isArray(json.warnings) ? json.warnings : []);
         setStage("review");
       } catch (e: any) {
         setErrorMsg(e?.message || "Extraction failed");
@@ -143,18 +156,12 @@ export default function AddClient() {
   const createMutation = useMutation({
     mutationFn: async () => {
       if (!extracted) throw new Error("Nothing to create");
-      // Build a credit report summary string. Prefer tri-bureau if available.
-      const b = (extracted as any).bureauScores || {};
-      const triParts: string[] = [];
-      if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
-      if (b.experian != null) triParts.push(`Experian ${b.experian}`);
-      if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
+      const b = extracted.bureauScores || { equifax: null, experian: null, transunion: null };
       const reportSummary =
-        triParts.length >= 2
-          ? triParts.join(", ")
-          : extracted.creditScore != null
+        formatBureauScores(b.equifax, b.experian, b.transunion) ||
+        (extracted.creditScore != null
           ? `${extracted.creditScore}${extracted.creditScoreSource ? ` (${extracted.creditScoreSource})` : ""}`
-          : "";
+          : "");
 
       const today = new Date().toISOString().slice(0, 10);
       const chargeOffsList = extracted.chargeOffs || [];
@@ -162,33 +169,27 @@ export default function AddClient() {
       const latePaymentsList = extracted.latePayments || [];
       const repossessionsList = extracted.repossessions || [];
       const publicRecordsList = extracted.publicRecords || [];
-      const within12 = latePaymentsList.filter((l) => l.withinTwelveMonths).length;
-      const between12And24 = latePaymentsList.filter(
-        (l) => !l.withinTwelveMonths && (Number(l.monthsSinceLate) || 0) > 0 && (Number(l.monthsSinceLate) || 0) <= 24
-      ).length;
-      const older = latePaymentsList.filter(
-        (l) => !l.withinTwelveMonths && (Number(l.monthsSinceLate) || 0) > 24
-      ).length;
+      const lateCounts = lateBucketCounts(latePaymentsList);
 
       const clientPayload: any = {
-        name: extracted.name || "Unnamed Client",
+        name: extracted.name?.trim() || "Unnamed Client",
         address: extracted.address || "",
         phone: extracted.phone || "",
         email: extracted.email || "",
         onboardingDate: today,
         status: "New" as const,
         recentCreditReport: reportSummary,
-        equifaxScore: b.equifax ?? null,
-        experianScore: b.experian ?? null,
-        transunionScore: b.transunion ?? null,
+        equifaxScore: validScore(b.equifax),
+        experianScore: validScore(b.experian),
+        transunionScore: validScore(b.transunion),
         personalNotes: "",
         creditAnalysisDate: today,
         chargeOffsCount: chargeOffsList.length,
         collectionsCount: collectionsList.length,
         latePaymentsCount: latePaymentsList.length,
-        latePaymentsWithin12moCount: within12,
-        latePayments12to24moCount: between12And24,
-        latePaymentsOlder24moCount: older,
+        latePaymentsWithin12moCount: lateCounts.within12,
+        latePayments12to24moCount: lateCounts.between12And24,
+        latePaymentsOlder24moCount: lateCounts.over24,
         repossessionsCount: repossessionsList.length,
         publicRecordsCount: publicRecordsList.length,
         totalAccountsCount: Number(extracted.totalAccountsCount) || 0,
@@ -203,23 +204,11 @@ export default function AddClient() {
         latePayments: latePaymentsList,
         repossessions: repossessionsList,
         publicRecords: publicRecordsList,
+        // Cards and derogatory rows are saved with the client in one transaction.
+        creditCards: extracted.creditCards || [],
       };
 
       const created = (await (await apiRequest("POST", "/api/clients", clientPayload)).json()) as Client;
-
-      // Add cards
-      for (const card of extracted.creditCards || []) {
-        await apiRequest("POST", `/api/clients/${created.id}/cards`, {
-          cardName: card.cardName || "Card",
-          issuer: card.issuer || "",
-          creditLimit: Number(card.creditLimit) || 0,
-          currentBalance: Number(card.currentBalance) || 0,
-          minimumPayment: card.minimumPayment != null ? Number(card.minimumPayment) : 0,
-          paymentDueDate: card.paymentDueDate || "",
-          accountStatus: card.accountStatus || "Current",
-          notes: "",
-        });
-      }
 
       // Attach PDF as file
       if (pdfBase64) {
@@ -228,7 +217,7 @@ export default function AddClient() {
           fileName: fileName || "credit-report.pdf",
           fileType: "credit_report",
           fileSize: Math.floor((cleaned.length * 3) / 4),
-          base64Content: pdfBase64,
+          base64Content: cleaned,
         });
       }
 
@@ -294,7 +283,7 @@ export default function AddClient() {
                 <Button variant="outline" className="mt-2" data-testid="button-choose-file">
                   Choose PDF
                 </Button>
-                <div className="text-xs text-muted-foreground">PDF only · up to 50 MB</div>
+                <div className="text-xs text-muted-foreground">PDF only · up to 35 MB</div>
               </div>
             </div>
           </Card>
@@ -323,7 +312,7 @@ export default function AddClient() {
             </div>
             <div className="text-xs text-muted-foreground max-w-sm">
               Reading the credit report and identifying personal details and account information.
-              This usually takes 10–30 seconds.
+              This can take from 30 seconds to a few minutes for long or image-based reports.
             </div>
           </div>
         </Card>
@@ -358,6 +347,8 @@ export default function AddClient() {
       {stage === "review" && extracted && (
         <ReviewExtracted
           data={extracted}
+          onChange={setExtracted}
+          warnings={warnings}
           fileName={fileName}
           onBack={() => setStage("upload")}
           onCreate={() => createMutation.mutate()}
@@ -370,18 +361,25 @@ export default function AddClient() {
 
 function ReviewExtracted({
   data,
+  onChange,
+  warnings,
   fileName,
   onBack,
   onCreate,
   isCreating,
 }: {
   data: ExtractedData;
+  onChange: (next: ExtractedData) => void;
+  warnings: string[];
   fileName: string;
   onBack: () => void;
   onCreate: () => void;
   isCreating: boolean;
 }) {
   const dash = (v: any) => (v === null || v === undefined || v === "" ? "—" : String(v));
+  const scores = data.bureauScores || { equifax: null, experian: null, transunion: null };
+  const mid = midScore([scores.equifax, scores.experian, scores.transunion]);
+  const lateCounts = lateBucketCounts(data.latePayments || []);
   const fmtMoney = (v: number) =>
     v === 0 || v == null ? "—" : `$${Number(v).toLocaleString()}`;
 
@@ -404,20 +402,69 @@ function ReviewExtracted({
           {fileName}
         </div>
 
-        <div className="space-y-4">
-          <ReadField label="Name" value={dash(data.name)} testId="extract-name" />
-          <ReadField label="Address" value={dash(data.address)} testId="extract-address" />
-          <ReadField label="Phone" value={dash(data.phone)} testId="extract-phone" />
-          <ReadField label="Email" value={dash(data.email)} testId="extract-email" />
-          <ReadField
-            label="Credit Score"
-            value={
-              data.creditScore != null
-                ? `${data.creditScore}${data.creditScoreSource ? ` (${data.creditScoreSource})` : ""}`
-                : "—"
-            }
-            testId="extract-credit-score"
+        {warnings.length > 0 && (
+          <div
+            className="mb-6 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900"
+            data-testid="extract-warnings"
+          >
+            <div className="flex items-center gap-2 font-semibold mb-1">
+              <AlertTriangle className="h-4 w-4" />
+              Check this extraction carefully
+            </div>
+            <ul className="list-disc pl-5 space-y-1">
+              {warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <EditField
+            label="Name"
+            value={data.name || ""}
+            onChange={(v) => onChange({ ...data, name: v })}
+            testId="extract-name"
+            placeholder="Not found — type the client's name"
           />
+          <EditField
+            label="Address"
+            value={data.address || ""}
+            onChange={(v) => onChange({ ...data, address: v })}
+            testId="extract-address"
+            placeholder="Not found"
+          />
+          <EditField
+            label="Phone"
+            value={data.phone || ""}
+            onChange={(v) => onChange({ ...data, phone: v })}
+            testId="extract-phone"
+            placeholder="Not found"
+          />
+          <EditField
+            label="Email"
+            value={data.email || ""}
+            onChange={(v) => onChange({ ...data, email: v })}
+            testId="extract-email"
+            placeholder="Not found"
+          />
+        </div>
+
+        <div className="mt-6">
+          <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
+            Credit Scores {mid != null && <span className="normal-case">· mid-score {mid}</span>}
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            {(["equifax", "experian", "transunion"] as const).map((k) => (
+              <ScoreField
+                key={k}
+                label={k === "equifax" ? "Equifax" : k === "experian" ? "Experian" : "TransUnion"}
+                value={scores[k]}
+                onChange={(v) => onChange({ ...data, bureauScores: { ...scores, [k]: v } })}
+                testId={`extract-score-${k}`}
+              />
+            ))}
+          </div>
         </div>
       </Card>
 
@@ -433,7 +480,7 @@ function ReviewExtracted({
             value={(data.latePayments || []).length}
             sub={
               (data.latePayments || []).length > 0
-                ? `${(data.latePayments || []).filter((l) => l.withinTwelveMonths).length} within 12mo`
+                ? `${lateCounts.within12} within 12mo`
                 : undefined
             }
           />
@@ -523,17 +570,53 @@ function ExtractStat({ label, value, sub }: { label: string; value: number; sub?
   );
 }
 
-function ReadField({ label, value, testId }: { label: string; value: string; testId?: string }) {
-  const isEmpty = value === "—";
+function EditField({
+  label,
+  value,
+  onChange,
+  testId,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  testId?: string;
+  placeholder?: string;
+}) {
   return (
-    <div className="space-y-1">
+    <label className="space-y-1 block">
       <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">{label}</div>
-      <div
-        className={`text-base ${isEmpty ? "text-muted-foreground" : "text-card-foreground"}`}
+      <Input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} data-testid={testId} />
+    </label>
+  );
+}
+
+function ScoreField({
+  label,
+  value,
+  onChange,
+  testId,
+}: {
+  label: string;
+  value: number | null;
+  onChange: (v: number | null) => void;
+  testId?: string;
+}) {
+  const invalid = value != null && validScore(value) == null;
+  return (
+    <label className="space-y-1 block">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <Input
+        type="number"
+        min={300}
+        max={850}
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
+        placeholder="—"
+        className={invalid ? "border-destructive" : undefined}
         data-testid={testId}
-      >
-        {value}
-      </div>
-    </div>
+      />
+      {invalid && <div className="text-xs text-destructive">Must be 300–850</div>}
+    </label>
   );
 }

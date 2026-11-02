@@ -12,15 +12,26 @@ import {
   utilBucket,
   utilizationColor,
   utilizationStatus,
+  isOpenCard,
 } from "@/lib/calculations";
 import type { CreditCard } from "@shared/schema";
 
-export function CreditCardsSection({ cards }: { clientId?: number; cards: CreditCard[] }) {
+export function CreditCardsSection({
+  cards,
+  utilStatusOverride,
+}: {
+  clientId?: number;
+  cards: CreditCard[];
+  utilStatusOverride?: string | null;
+}) {
   const overallUtil = overallUtilization(cards);
   const utilColor = utilizationColor(overallUtil);
-  const utilStat = utilizationStatus(overallUtil);
+  const utilStat = utilStatusOverride || utilizationStatus(overallUtil);
+  const openCards = cards.filter(isOpenCard);
+  const excludedCount = cards.length - openCards.length;
 
-  const totals = cards.reduce(
+  // Totals cover open cards only, matching the utilization figure.
+  const totals = openCards.reduce(
     (acc, c) => {
       acc.limit += c.creditLimit || 0;
       acc.balance += c.currentBalance || 0;
@@ -80,6 +91,25 @@ export function CreditCardsSection({ cards }: { clientId?: number; cards: Credit
               </tr>
             )}
             {cards.map((card) => {
+              if (!isOpenCard(card)) {
+                return (
+                  <tr
+                    key={card.id}
+                    className="border-t border-border text-muted-foreground"
+                    style={{ borderLeft: "4px solid #cbd5e1" }}
+                    data-testid={`row-card-${card.id}`}
+                  >
+                    <td className="px-3 py-3 font-medium">{card.cardName || "—"}</td>
+                    <td className="px-3 py-3">{card.issuer || "—"}</td>
+                    <td className="px-3 py-3 text-right tabular-nums">{fmtCurrency(card.creditLimit)}</td>
+                    <td className="px-3 py-3 text-right tabular-nums">{fmtCurrency(card.currentBalance)}</td>
+                    <td colSpan={4} className="px-3 py-3 text-right text-xs italic">
+                      Not counted toward utilization
+                    </td>
+                    <td className="px-3 py-3">{card.accountStatus}</td>
+                  </tr>
+                );
+              }
               const util = cardUtilization(card);
               const bucket = utilBucket(util);
               const color = bucketHex(bucket);
@@ -130,8 +160,8 @@ export function CreditCardsSection({ cards }: { clientId?: number; cards: Credit
           {cards.length > 0 && (
             <tfoot className="bg-muted/30 text-card-foreground font-medium">
               <tr className="border-t-2 border-border">
-                <td colSpan={2} className="px-3 py-3 text-xs uppercase tracking-wide">
-                  Totals
+                <td colSpan={2} className="px-3 py-3 text-xs uppercase tracking-wide" data-testid="text-totals-label">
+                  {excludedCount > 0 ? "Totals (open cards)" : "Totals"}
                 </td>
                 <td className="px-3 py-3 text-right tabular-nums">{fmtCurrency(totals.limit)}</td>
                 <td className="px-3 py-3 text-right tabular-nums">{fmtCurrency(totals.balance)}</td>
