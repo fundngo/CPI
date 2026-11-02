@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
 import { useMutation } from "@tanstack/react-query";
 import { useLocation, Link } from "wouter";
@@ -6,8 +6,11 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import type { Client } from "@shared/schema";
-import { ArrowLeft, UploadCloud, Loader2, FileText, AlertCircle, CheckCircle2 } from "lucide-react";
+import { CARD_STATUSES, type CardStatus, type Client } from "@shared/schema";
+import { formatBureauScores, normalizeAge, splitLatePayments, validScore } from "@shared/credit";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ArrowLeft, UploadCloud, Loader2, FileText, AlertCircle, CheckCircle2, Plus, X } from "lucide-react";
 
 interface ExtractedCard {
   cardName: string;
@@ -67,20 +70,64 @@ interface ExtractedPublicRecord {
 interface ExtractedData {
   name: string;
   address: string;
-  phone: string | null;
-  email: string | null;
+  phone: string;
+  email: string;
   creditScore: number | null;
   creditScoreSource: string | null;
+  bureauScores: { equifax: number | null; experian: number | null; transunion: number | null };
   creditCards: ExtractedCard[];
-  chargeOffs?: ExtractedChargeOff[];
-  collections?: ExtractedCollection[];
-  latePayments?: ExtractedLatePayment[];
-  repossessions?: ExtractedRepossession[];
-  publicRecords?: ExtractedPublicRecord[];
+  chargeOffs: ExtractedChargeOff[];
+  collections: ExtractedCollection[];
+  latePayments: ExtractedLatePayment[];
+  repossessions: ExtractedRepossession[];
+  publicRecords: ExtractedPublicRecord[];
   totalAccountsCount?: number;
   oldestAccount?: { creditor: string; year: number } | null;
   newestAccount?: { creditor: string; year: number } | null;
   avgAccountAge?: { years: number; months: number } | null;
+}
+
+function toDraft(raw: any): ExtractedData {
+  const arr = (v: any) => (Array.isArray(v) ? v : []);
+  const b = raw?.bureauScores || {};
+  return {
+    name: String(raw?.name || ""),
+    address: String(raw?.address || ""),
+    phone: String(raw?.phone || ""),
+    email: String(raw?.email || ""),
+    creditScore: validScore(raw?.creditScore),
+    creditScoreSource: raw?.creditScoreSource || null,
+    bureauScores: { equifax: validScore(b.equifax), experian: validScore(b.experian), transunion: validScore(b.transunion) },
+    creditCards: arr(raw?.creditCards).map((c: any) => ({
+      cardName: String(c?.cardName || ""),
+      issuer: String(c?.issuer || ""),
+      creditLimit: Number(c?.creditLimit) || 0,
+      currentBalance: Number(c?.currentBalance) || 0,
+      minimumPayment: c?.minimumPayment != null ? Number(c.minimumPayment) || 0 : null,
+      paymentDueDate: c?.paymentDueDate || null,
+      accountStatus: (CARD_STATUSES as readonly string[]).includes(c?.accountStatus) ? c.accountStatus : "Current",
+    })),
+    chargeOffs: arr(raw?.chargeOffs),
+    collections: arr(raw?.collections),
+    latePayments: arr(raw?.latePayments),
+    repossessions: arr(raw?.repossessions),
+    publicRecords: arr(raw?.publicRecords),
+    totalAccountsCount: Number(raw?.totalAccountsCount) || 0,
+    oldestAccount: raw?.oldestAccount || null,
+    newestAccount: raw?.newestAccount || null,
+    avgAccountAge: raw?.avgAccountAge || null,
+  };
+}
+
+// apiRequest errors look like "500: {\"message\":\"...\"}" — show just the message.
+function cleanError(msg: string): string {
+  const m = msg.match(/^\d{3}:\s*([\s\S]*)$/);
+  const body = m ? m[1] : msg;
+  try {
+    const j = JSON.parse(body);
+    if (j?.message) return String(j.message);
+  } catch {}
+  return body;
 }
 
 type Stage = "upload" | "extracting" | "review" | "error" | "creating";
@@ -93,6 +140,14 @@ export default function AddClient() {
   const [pdfBase64, setPdfBase64] = useState<string>("");
   const [fileName, setFileName] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (stage !== "extracting") return;
+    setElapsed(0);
+    const t = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [stage]);
 
   const fileToBase64 = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
@@ -124,10 +179,10 @@ export default function AddClient() {
         if (!json?.extracted) {
           throw new Error("No data returned");
         }
-        setExtracted(json.extracted as ExtractedData);
+        setExtracted(toDraft(json.extracted));
         setStage("review");
       } catch (e: any) {
-        setErrorMsg(e?.message || "Extraction failed");
+        setErrorMsg(cleanError(e?.message || "Extraction failed"));
         setStage("error");
       }
     },
@@ -143,96 +198,58 @@ export default function AddClient() {
   const createMutation = useMutation({
     mutationFn: async () => {
       if (!extracted) throw new Error("Nothing to create");
-      // Build a credit report summary string. Prefer tri-bureau if available.
-      const b = (extracted as any).bureauScores || {};
-      const triParts: string[] = [];
-      if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
-      if (b.experian != null) triParts.push(`Experian ${b.experian}`);
-      if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
-      const reportSummary =
-        triParts.length >= 2
-          ? triParts.join(", ")
-          : extracted.creditScore != null
-          ? `${extracted.creditScore}${extracted.creditScoreSource ? ` (${extracted.creditScoreSource})` : ""}`
-          : "";
-
+      if (!extracted.name.trim()) throw new Error("Enter the client's name before creating.");
+      const b = extracted.bureauScores;
       const today = new Date().toISOString().slice(0, 10);
-      const chargeOffsList = extracted.chargeOffs || [];
-      const collectionsList = extracted.collections || [];
-      const latePaymentsList = extracted.latePayments || [];
-      const repossessionsList = extracted.repossessions || [];
-      const publicRecordsList = extracted.publicRecords || [];
-      const within12 = latePaymentsList.filter((l) => l.withinTwelveMonths).length;
-      const between12And24 = latePaymentsList.filter(
-        (l) => !l.withinTwelveMonths && (Number(l.monthsSinceLate) || 0) > 0 && (Number(l.monthsSinceLate) || 0) <= 24
-      ).length;
-      const older = latePaymentsList.filter(
-        (l) => !l.withinTwelveMonths && (Number(l.monthsSinceLate) || 0) > 24
-      ).length;
+      const late = splitLatePayments(extracted.latePayments);
+      const age = normalizeAge(extracted.avgAccountAge?.years, extracted.avgAccountAge?.months);
+      const tri = formatBureauScores(b);
+      const cleaned = pdfBase64.includes(",") ? pdfBase64.split(",")[1] : pdfBase64;
 
-      const clientPayload: any = {
-        name: extracted.name || "Unnamed Client",
-        address: extracted.address || "",
-        phone: extracted.phone || "",
-        email: extracted.email || "",
+      const payload = {
+        name: extracted.name.trim(),
+        address: extracted.address.trim(),
+        phone: (extracted.phone || "").trim(),
+        email: (extracted.email || "").trim(),
         onboardingDate: today,
         status: "New" as const,
-        recentCreditReport: reportSummary,
-        equifaxScore: b.equifax ?? null,
-        experianScore: b.experian ?? null,
-        transunionScore: b.transunion ?? null,
-        personalNotes: "",
+        recentCreditReport:
+          tri || (extracted.creditScore != null ? `${extracted.creditScore}${extracted.creditScoreSource ? ` (${extracted.creditScoreSource})` : ""}` : ""),
+        equifaxScore: b.equifax,
+        experianScore: b.experian,
+        transunionScore: b.transunion,
         creditAnalysisDate: today,
-        chargeOffsCount: chargeOffsList.length,
-        collectionsCount: collectionsList.length,
-        latePaymentsCount: latePaymentsList.length,
-        latePaymentsWithin12moCount: within12,
-        latePayments12to24moCount: between12And24,
-        latePaymentsOlder24moCount: older,
-        repossessionsCount: repossessionsList.length,
-        publicRecordsCount: publicRecordsList.length,
-        totalAccountsCount: Number(extracted.totalAccountsCount) || 0,
-        avgAccountAgeYears: Number(extracted.avgAccountAge?.years) || 0,
-        avgAccountAgeMonths: Number(extracted.avgAccountAge?.months) || 0,
+        chargeOffsCount: extracted.chargeOffs.length,
+        collectionsCount: extracted.collections.length,
+        latePaymentsCount: extracted.latePayments.length,
+        latePaymentsWithin12moCount: late.within12.length,
+        latePayments12to24moCount: late["12to24"].length,
+        latePaymentsOlder24moCount: late.over24.length,
+        repossessionsCount: extracted.repossessions.length,
+        publicRecordsCount: extracted.publicRecords.length,
+        totalAccountsCount: Math.max(0, Math.round(Number(extracted.totalAccountsCount) || 0)),
+        avgAccountAgeYears: age.years,
+        avgAccountAgeMonths: age.months,
         oldestAccountCreditor: extracted.oldestAccount?.creditor || "",
-        oldestAccountYear: Number(extracted.oldestAccount?.year) || 0,
+        oldestAccountYear: Math.round(Number(extracted.oldestAccount?.year) || 0),
         newestAccountCreditor: extracted.newestAccount?.creditor || "",
-        newestAccountYear: Number(extracted.newestAccount?.year) || 0,
-        chargeOffs: chargeOffsList,
-        collections: collectionsList,
-        latePayments: latePaymentsList,
-        repossessions: repossessionsList,
-        publicRecords: publicRecordsList,
+        newestAccountYear: Math.round(Number(extracted.newestAccount?.year) || 0),
+        creditCards: extracted.creditCards,
+        chargeOffs: extracted.chargeOffs,
+        collections: extracted.collections,
+        latePayments: extracted.latePayments,
+        repossessions: extracted.repossessions,
+        publicRecords: extracted.publicRecords,
+        file: pdfBase64
+          ? {
+              fileName: fileName || "credit-report.pdf",
+              fileType: "credit_report" as const,
+              fileSize: Math.floor((cleaned.length * 3) / 4),
+              base64Content: cleaned,
+            }
+          : undefined,
       };
-
-      const created = (await (await apiRequest("POST", "/api/clients", clientPayload)).json()) as Client;
-
-      // Add cards
-      for (const card of extracted.creditCards || []) {
-        await apiRequest("POST", `/api/clients/${created.id}/cards`, {
-          cardName: card.cardName || "Card",
-          issuer: card.issuer || "",
-          creditLimit: Number(card.creditLimit) || 0,
-          currentBalance: Number(card.currentBalance) || 0,
-          minimumPayment: card.minimumPayment != null ? Number(card.minimumPayment) : 0,
-          paymentDueDate: card.paymentDueDate || "",
-          accountStatus: card.accountStatus || "Current",
-          notes: "",
-        });
-      }
-
-      // Attach PDF as file
-      if (pdfBase64) {
-        const cleaned = pdfBase64.includes(",") ? pdfBase64.split(",")[1] : pdfBase64;
-        await apiRequest("POST", `/api/clients/${created.id}/files`, {
-          fileName: fileName || "credit-report.pdf",
-          fileType: "credit_report",
-          fileSize: Math.floor((cleaned.length * 3) / 4),
-          base64Content: pdfBase64,
-        });
-      }
-
-      return created;
+      return (await (await apiRequest("POST", "/api/clients", payload)).json()) as Client;
     },
     onSuccess: (client) => {
       queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
@@ -321,9 +338,13 @@ export default function AddClient() {
               <FileText className="h-4 w-4" />
               {fileName}
             </div>
-            <div className="text-xs text-muted-foreground max-w-sm">
-              Reading the credit report and identifying personal details and account information.
-              This usually takes 10–30 seconds.
+            <div className="text-xs text-muted-foreground max-w-sm" data-testid="text-extract-progress">
+              {elapsed < 20
+                ? "Reading the credit report and finding personal details, scores, and accounts. This usually takes 10–30 seconds."
+                : elapsed < 45
+                ? "Still working — larger reports take longer."
+                : "This looks like a scanned or encoded-font PDF, so we're reading the pages as images. This can take up to 2 minutes."}
+              <div className="mt-2 tabular-nums">{elapsed}s</div>
             </div>
           </div>
         </Card>
@@ -339,8 +360,8 @@ export default function AddClient() {
               <div className="text-lg font-semibold text-card-foreground">
                 Could not extract data from this file
               </div>
-              <div className="text-sm text-muted-foreground mt-2 max-w-md">
-                Try a different PDF or enter manually. {errorMsg && <span className="block mt-1 text-xs">{errorMsg}</span>}
+              <div className="text-sm text-card-foreground mt-2 max-w-md" data-testid="text-extract-error">
+                {errorMsg || "Try a different PDF or enter the client manually."}
               </div>
             </div>
             <div className="flex gap-3 mt-2">
@@ -358,6 +379,7 @@ export default function AddClient() {
       {stage === "review" && extracted && (
         <ReviewExtracted
           data={extracted}
+          onChange={setExtracted}
           fileName={fileName}
           onBack={() => setStage("upload")}
           onCreate={() => createMutation.mutate()}
@@ -368,22 +390,52 @@ export default function AddClient() {
   );
 }
 
+type DerogKey = "chargeOffs" | "collections" | "latePayments" | "repossessions" | "publicRecords";
+
+const DEROG_SECTIONS: Array<{ key: DerogKey; label: string; describe: (r: any) => string }> = [
+  { key: "chargeOffs", label: "Charge-Offs", describe: (r) => `${r.creditor || "—"} · ${r.accountType || "—"} · bal $${Number(r.balance || 0).toLocaleString()}` },
+  { key: "collections", label: "Collections", describe: (r) => `${r.creditor || "—"}${r.originalCreditor ? ` (orig. ${r.originalCreditor})` : ""} · bal $${Number(r.balance || 0).toLocaleString()}` },
+  { key: "latePayments", label: "Late Payments", describe: (r) => `${r.creditor || "—"} · ${r.lateHistory || "—"} · last ${r.mostRecentLateDate || "—"}` },
+  { key: "repossessions", label: "Repossessions", describe: (r) => `${r.creditor || "—"} · ${r.accountType || "—"} · repo ${r.repoDate || "—"}` },
+  { key: "publicRecords", label: "Public Records", describe: (r) => `${r.recordType || "Other"} · ${r.courtOrAgency || "—"} · filed ${r.filedDate || "—"}` },
+];
+
 function ReviewExtracted({
   data,
+  onChange,
   fileName,
   onBack,
   onCreate,
   isCreating,
 }: {
   data: ExtractedData;
+  onChange: (d: ExtractedData) => void;
   fileName: string;
   onBack: () => void;
   onCreate: () => void;
   isCreating: boolean;
 }) {
-  const dash = (v: any) => (v === null || v === undefined || v === "" ? "—" : String(v));
-  const fmtMoney = (v: number) =>
-    v === 0 || v == null ? "—" : `$${Number(v).toLocaleString()}`;
+  const set = <K extends keyof ExtractedData>(k: K, v: ExtractedData[K]) => onChange({ ...data, [k]: v });
+  const setScore = (bureau: "equifax" | "experian" | "transunion", raw: string) => {
+    const v = raw.trim() === "" ? null : Number(raw);
+    onChange({ ...data, bureauScores: { ...data.bureauScores, [bureau]: v } });
+  };
+  const scoreInvalid = (v: number | null) => v != null && (v < 300 || v > 850 || !Number.isInteger(v));
+  const anyScoreInvalid = (["equifax", "experian", "transunion"] as const).some((k) => scoreInvalid(data.bureauScores[k]));
+
+  const updateCard = (i: number, patch: Partial<ExtractedCard>) =>
+    set("creditCards", data.creditCards.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
+  const removeCard = (i: number) => set("creditCards", data.creditCards.filter((_, idx) => idx !== i));
+  const addCard = () =>
+    set("creditCards", [
+      ...data.creditCards,
+      { cardName: "", issuer: "", creditLimit: 0, currentBalance: 0, minimumPayment: null, paymentDueDate: null, accountStatus: "Current" },
+    ]);
+  const removeDerog = (key: DerogKey, i: number) =>
+    onChange({ ...data, [key]: (data[key] as any[]).filter((_, idx) => idx !== i) });
+
+  const late = splitLatePayments(data.latePayments);
+  const nameMissing = !data.name.trim();
 
   return (
     <div className="space-y-5">
@@ -393,94 +445,180 @@ function ReviewExtracted({
             <CheckCircle2 className="h-5 w-5 text-primary" />
           </div>
           <div>
-            <div className="text-xl font-semibold text-card-foreground">Review extracted data</div>
+            <div className="text-xl font-bold text-card-foreground">Review extracted data</div>
             <div className="text-sm text-muted-foreground">
-              Confirm what we found before creating the client.
+              Check and correct anything below before creating the client. Blank means the report didn't show it.
             </div>
           </div>
         </div>
-        <div className="text-xs text-muted-foreground mt-4 mb-6 flex items-center gap-2">
+        <div className="text-xs text-muted-foreground mt-4 mb-6 flex items-center gap-2" data-testid="text-review-filename">
           <FileText className="h-3.5 w-3.5" />
           {fileName}
         </div>
 
-        <div className="space-y-4">
-          <ReadField label="Name" value={dash(data.name)} testId="extract-name" />
-          <ReadField label="Address" value={dash(data.address)} testId="extract-address" />
-          <ReadField label="Phone" value={dash(data.phone)} testId="extract-phone" />
-          <ReadField label="Email" value={dash(data.email)} testId="extract-email" />
-          <ReadField
-            label="Credit Score"
-            value={
-              data.creditScore != null
-                ? `${data.creditScore}${data.creditScoreSource ? ` (${data.creditScoreSource})` : ""}`
-                : "—"
-            }
-            testId="extract-credit-score"
-          />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <EditField label="Name (required)" className="md:col-span-2">
+            <Input
+              value={data.name}
+              onChange={(e) => set("name", e.target.value)}
+              placeholder="Client's full name"
+              className={nameMissing ? "border-destructive" : ""}
+              data-testid="input-extract-name"
+            />
+          </EditField>
+          <EditField label="Address" className="md:col-span-2">
+            <Input
+              value={data.address}
+              onChange={(e) => set("address", e.target.value)}
+              placeholder="STREET, CITY ST ZIP"
+              data-testid="input-extract-address"
+            />
+          </EditField>
+          <EditField label="Phone">
+            <Input value={data.phone} onChange={(e) => set("phone", e.target.value)} data-testid="input-extract-phone" />
+          </EditField>
+          <EditField label="Email">
+            <Input value={data.email} onChange={(e) => set("email", e.target.value)} data-testid="input-extract-email" />
+          </EditField>
         </div>
+
+        <div className="grid grid-cols-3 gap-4 mt-5">
+          {(["equifax", "experian", "transunion"] as const).map((k) => (
+            <EditField key={k} label={k === "transunion" ? "TransUnion" : k[0].toUpperCase() + k.slice(1)}>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={300}
+                max={850}
+                value={data.bureauScores[k] ?? ""}
+                onChange={(e) => setScore(k, e.target.value)}
+                placeholder="—"
+                className={scoreInvalid(data.bureauScores[k]) ? "border-destructive" : ""}
+                data-testid={`input-extract-${k}`}
+              />
+            </EditField>
+          ))}
+        </div>
+        {anyScoreInvalid && (
+          <div className="text-xs text-destructive mt-2" data-testid="text-score-error">
+            Scores must be whole numbers from 300 to 850 (or blank).
+          </div>
+        )}
       </Card>
 
       <Card className="p-8 border-card-border shadow-xl ring-1 ring-white/5 rounded-xl">
-        <div className="text-sm font-semibold uppercase tracking-wide text-muted-foreground mb-4">
-          Credit Analysis
+        <div className="flex items-center justify-between mb-4">
+          <div className="text-sm font-bold uppercase tracking-wide text-card-foreground">
+            Credit Cards ({data.creditCards.length})
+          </div>
+          <Button variant="outline" size="sm" onClick={addCard} className="gap-1.5" data-testid="button-extract-add-card">
+            <Plus className="h-3.5 w-3.5" /> Add card
+          </Button>
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-          <ExtractStat label="Charge-Offs" value={(data.chargeOffs || []).length} />
-          <ExtractStat label="Collections" value={(data.collections || []).length} />
-          <ExtractStat
-            label="Late Payments"
-            value={(data.latePayments || []).length}
-            sub={
-              (data.latePayments || []).length > 0
-                ? `${(data.latePayments || []).filter((l) => l.withinTwelveMonths).length} within 12mo`
-                : undefined
-            }
-          />
-          <ExtractStat label="Repossessions" value={(data.repossessions || []).length} />
-          <ExtractStat label="Public Records" value={(data.publicRecords || []).length} />
-          <ExtractStat
-            label="Accounts Found"
-            value={Number(data.totalAccountsCount) || (data.creditCards || []).length}
-            sub={
-              data.avgAccountAge
-                ? `avg ${data.avgAccountAge.years}y ${data.avgAccountAge.months}m`
-                : undefined
-            }
-          />
-        </div>
-      </Card>
-
-      <Card className="p-8 border-card-border shadow-xl ring-1 ring-white/5 rounded-xl">
-        <div className="text-sm font-semibold uppercase tracking-wide text-muted-foreground mb-4">
-          Credit Cards ({(data.creditCards || []).length})
-        </div>
-        {(data.creditCards || []).length === 0 ? (
+        {data.creditCards.length === 0 ? (
           <div className="text-sm text-muted-foreground">No credit cards found.</div>
         ) : (
           <div className="overflow-x-auto -mx-2">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm min-w-[640px]">
               <thead className="text-xs uppercase tracking-wide text-muted-foreground">
                 <tr>
-                  <th className="px-2 py-2 text-left font-medium">Card</th>
-                  <th className="px-2 py-2 text-left font-medium">Issuer</th>
-                  <th className="px-2 py-2 text-right font-medium">Limit</th>
-                  <th className="px-2 py-2 text-right font-medium">Balance</th>
-                  <th className="px-2 py-2 text-left font-medium">Status</th>
+                  <th className="px-2 py-2 text-left font-semibold">Card</th>
+                  <th className="px-2 py-2 text-left font-semibold">Issuer</th>
+                  <th className="px-2 py-2 text-right font-semibold">Limit</th>
+                  <th className="px-2 py-2 text-right font-semibold">Balance</th>
+                  <th className="px-2 py-2 text-left font-semibold">Status</th>
+                  <th className="px-2 py-2" />
                 </tr>
               </thead>
               <tbody className="text-card-foreground">
                 {data.creditCards.map((c, i) => (
                   <tr key={i} className="border-t border-border" data-testid={`extract-card-${i}`}>
-                    <td className="px-2 py-2.5">{dash(c.cardName)}</td>
-                    <td className="px-2 py-2.5">{dash(c.issuer)}</td>
-                    <td className="px-2 py-2.5 text-right tabular-nums">{fmtMoney(c.creditLimit)}</td>
-                    <td className="px-2 py-2.5 text-right tabular-nums">{fmtMoney(c.currentBalance)}</td>
-                    <td className="px-2 py-2.5">{dash(c.accountStatus)}</td>
+                    <td className="px-2 py-1.5">
+                      <Input className="h-8" value={c.cardName} onChange={(e) => updateCard(i, { cardName: e.target.value })} data-testid={`input-extract-card-name-${i}`} />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Input className="h-8" value={c.issuer} onChange={(e) => updateCard(i, { issuer: e.target.value })} data-testid={`input-extract-card-issuer-${i}`} />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Input className="h-8 text-right w-24 ml-auto" type="number" min={0} value={c.creditLimit} onChange={(e) => updateCard(i, { creditLimit: Number(e.target.value) || 0 })} data-testid={`input-extract-card-limit-${i}`} />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Input className="h-8 text-right w-24 ml-auto" type="number" min={0} value={c.currentBalance} onChange={(e) => updateCard(i, { currentBalance: Number(e.target.value) || 0 })} data-testid={`input-extract-card-balance-${i}`} />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Select value={c.accountStatus} onValueChange={(v) => updateCard(i, { accountStatus: v as CardStatus })}>
+                        <SelectTrigger className="h-8 w-32" data-testid={`select-extract-card-status-${i}`}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {CARD_STATUSES.map((st) => (
+                            <SelectItem key={st} value={st}>{st}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </td>
+                    <td className="px-2 py-1.5 text-right">
+                      <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive" onClick={() => removeCard(i)} data-testid={`button-extract-remove-card-${i}`}>
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </Card>
+
+      <Card className="p-8 border-card-border shadow-xl ring-1 ring-white/5 rounded-xl">
+        <div className="text-sm font-bold uppercase tracking-wide text-card-foreground mb-1">Credit Analysis</div>
+        <div className="text-xs text-muted-foreground mb-4">
+          Remove any item that doesn't belong — the counts update to match.
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+          <ExtractStat label="Charge-Offs" value={data.chargeOffs.length} />
+          <ExtractStat label="Collections" value={data.collections.length} />
+          <ExtractStat
+            label="Late Payments"
+            value={data.latePayments.length}
+            sub={data.latePayments.length > 0 ? `${late.within12.length} within 12mo` : undefined}
+          />
+          <ExtractStat label="Repossessions" value={data.repossessions.length} />
+          <ExtractStat label="Public Records" value={data.publicRecords.length} />
+          <ExtractStat
+            label="Accounts Found"
+            value={Number(data.totalAccountsCount) || 0}
+            sub={
+              data.avgAccountAge && (data.avgAccountAge.years || data.avgAccountAge.months)
+                ? `avg age ${normalizeAge(data.avgAccountAge.years, data.avgAccountAge.months).years}y ${normalizeAge(data.avgAccountAge.years, data.avgAccountAge.months).months}m`
+                : undefined
+            }
+          />
+        </div>
+
+        {DEROG_SECTIONS.some((sec) => (data[sec.key] as any[]).length > 0) && (
+          <div className="mt-6 space-y-4">
+            {DEROG_SECTIONS.filter((sec) => (data[sec.key] as any[]).length > 0).map((sec) => (
+              <div key={sec.key} data-testid={`extract-derog-${sec.key}`}>
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold mb-1.5">{sec.label}</div>
+                <ul className="space-y-1">
+                  {(data[sec.key] as any[]).map((row, i) => (
+                    <li key={i} className="flex items-center justify-between gap-3 text-sm text-card-foreground border border-border rounded-md px-3 py-1.5">
+                      <span className="truncate">{sec.describe(row)}</span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-destructive shrink-0"
+                        onClick={() => removeDerog(sec.key, i)}
+                        data-testid={`button-remove-${sec.key}-${i}`}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
           </div>
         )}
       </Card>
@@ -495,15 +633,27 @@ function ReviewExtracted({
           <ArrowLeft className="h-4 w-4" />
           Back
         </Button>
-        <Button
-          onClick={onCreate}
-          disabled={isCreating}
-          className="px-8 h-11 rounded-lg font-medium"
-          data-testid="button-create-client"
-        >
-          {isCreating ? "Creating…" : "Create Client"}
-        </Button>
+        <div className="flex items-center gap-3">
+          {nameMissing && <span className="text-sm text-white/70">Enter a name to continue</span>}
+          <Button
+            onClick={onCreate}
+            disabled={isCreating || nameMissing || anyScoreInvalid}
+            className="px-8 h-11 rounded-lg font-semibold"
+            data-testid="button-create-client"
+          >
+            {isCreating ? "Creating…" : "Create Client"}
+          </Button>
+        </div>
       </div>
+    </div>
+  );
+}
+
+function EditField({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
+  return (
+    <div className={`space-y-1.5 ${className || ""}`}>
+      <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">{label}</div>
+      {children}
     </div>
   );
 }
@@ -511,29 +661,13 @@ function ReviewExtracted({
 function ExtractStat({ label, value, sub }: { label: string; value: number; sub?: string }) {
   return (
     <div
-      className="rounded-lg border border-card-border bg-muted/30 p-4"
+      className="rounded-lg border border-card-border bg-muted/40 p-4"
+      style={value > 0 && label !== "Accounts Found" ? { boxShadow: "inset 3px 0 0 hsl(0 72% 55%)" } : undefined}
       data-testid={`extract-stat-${label.toLowerCase().replace(/[^a-z]+/g, "-")}`}
     >
-      <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-        {label}
-      </div>
+      <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold">{label}</div>
       <div className="text-2xl font-bold tabular-nums mt-1 text-card-foreground">{value}</div>
       {sub && <div className="text-xs text-muted-foreground mt-1">{sub}</div>}
-    </div>
-  );
-}
-
-function ReadField({ label, value, testId }: { label: string; value: string; testId?: string }) {
-  const isEmpty = value === "—";
-  return (
-    <div className="space-y-1">
-      <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">{label}</div>
-      <div
-        className={`text-base ${isEmpty ? "text-muted-foreground" : "text-card-foreground"}`}
-        data-testid={testId}
-      >
-        {value}
-      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import type { Client, CreditCard, ClientWithDetails } from "@shared/schema";
+import type { Client, CreditCard, ClientWithCards } from "@shared/schema";
 
 export type RevenueStatus = "None" | "Starting" | "Growing" | "Strong";
 export type UtilStatus = "Excellent" | "Good" | "Caution" | "Critical";
@@ -33,8 +33,13 @@ export function strengthLabel(score: number): "Weak" | "Fair" | "Strong" {
   return "Weak";
 }
 
+/** Closed and Charged Off cards never count toward utilization totals. */
+export function isActiveCard(c: Pick<CreditCard, "accountStatus">): boolean {
+  return c.accountStatus !== "Closed" && c.accountStatus !== "Charged Off";
+}
+
 export function overallUtilization(cards: CreditCard[]): number {
-  const activeCards = cards.filter(c => c.accountStatus !== "Closed" && c.accountStatus !== "Charged Off");
+  const activeCards = cards.filter(isActiveCard);
   const totalLimit = activeCards.reduce((s, c) => s + (c.creditLimit || 0), 0);
   const totalBal = activeCards.reduce((s, c) => s + (c.currentBalance || 0), 0);
   if (totalLimit <= 0) return 0;
@@ -62,12 +67,22 @@ export function utilizationStatus(utilPct: number): UtilStatus {
   return "Critical";
 }
 
+// Status colors: green = good, amber = watch, red = problem.
+export const STATUS_GREEN = "hsl(120 60% 40%)";
+export const STATUS_AMBER = "hsl(38 92% 50%)";
+export const STATUS_RED = "hsl(0 72% 55%)";
+
+/** Color for overall utilization, matching utilizationStatus(). */
 export function utilizationColor(utilPct: number): string {
-  if (utilPct < 10) return "hsl(120 60% 45%)"; // brand green
-  if (utilPct < 30) return "hsl(120 60% 45%)";
-  if (utilPct < 50) return "hsl(38 92% 50%)"; // amber
-  if (utilPct < 75) return "hsl(20 90% 50%)"; // orange
-  return "hsl(0 72% 51%)"; // red
+  if (utilPct < 30) return STATUS_GREEN; // Excellent / Good
+  if (utilPct < 50) return STATUS_AMBER; // Caution
+  return STATUS_RED; // Critical
+}
+
+export function strengthColor(score: number): string {
+  if (score >= 70) return STATUS_GREEN;
+  if (score >= 40) return STATUS_AMBER;
+  return STATUS_RED;
 }
 
 // ---- CPI Sheet helpers (color buckets + paydown targets) ----
@@ -107,6 +122,38 @@ export function paydownTo(currentBalance: number, creditLimit: number, pct: numb
   return Math.round(owed);
 }
 
+/**
+ * Overall paydown needed (open cards only) to bring total utilization to the
+ * 30% and 15% targets. `balanceAt*` is the total balance after paying down.
+ */
+export function paydownSummary(cards: CreditCard[]) {
+  const active = cards.filter(isActiveCard);
+  const limit = active.reduce((s, c) => s + (c.creditLimit || 0), 0);
+  const balance = active.reduce((s, c) => s + (c.currentBalance || 0), 0);
+  const target30 = Math.round(limit * 0.3);
+  const target15 = Math.round(limit * 0.15);
+  return {
+    limit,
+    balance,
+    target30,
+    target15,
+    paydown30: Math.max(0, Math.round(balance - target30)),
+    paydown15: Math.max(0, Math.round(balance - target15)),
+  };
+}
+
+/** Utilization status label, honoring the manual override when set. */
+export function utilizationStatusFor(client: ClientWithCards): string {
+  const o = client.creditUtilizationStatusOverride?.trim();
+  return o || utilizationStatus(overallUtilization(client.creditCards));
+}
+
+/** Revenue status label, honoring the manual override when set. */
+export function businessRevenueStatusFor(client: Client): string {
+  const o = client.businessRevenueStatusOverride?.trim();
+  return o || businessRevenueStatus(client.monthlyRevenue);
+}
+
 export function businessRevenueScore(monthly: number): number {
   if (monthly >= 50000) return 100;
   if (monthly >= 20000) return 85;
@@ -131,7 +178,7 @@ export function parseMissingDocs(json: string): string[] {
   }
 }
 
-export function fundingReadinessScore(client: ClientWithDetails): number {
+export function fundingReadinessScore(client: ClientWithCards): number {
   if (client.fundingReadinessScoreOverride != null) return clamp(client.fundingReadinessScoreOverride, 0, 100);
   const util = overallUtilization(client.creditCards);
   const pb = personalBankingStrength(client);
@@ -145,12 +192,12 @@ export function fundingReadinessScore(client: ClientWithDetails): number {
 }
 
 export function readinessLabel(score: number): { label: string; color: string } {
-  if (score >= 80) return { label: "Funding Ready", color: "hsl(120 60% 45%)" };
-  if (score >= 50) return { label: "Almost Ready", color: "hsl(38 92% 50%)" };
-  return { label: "Not Ready", color: "hsl(0 72% 51%)" };
+  if (score >= 80) return { label: "Funding Ready", color: STATUS_GREEN };
+  if (score >= 50) return { label: "Almost Ready", color: STATUS_AMBER };
+  return { label: "Not Ready", color: STATUS_RED };
 }
 
-export function autoRecommendedSteps(client: ClientWithDetails): string[] {
+export function autoRecommendedSteps(client: ClientWithCards): string[] {
   const steps: string[] = [];
   const util = overallUtilization(client.creditCards);
   const missing = parseMissingDocs(client.missingDocuments);
@@ -173,7 +220,7 @@ export function autoRecommendedSteps(client: ClientWithDetails): string[] {
 
 export type Flag = { kind: "red" | "amber" | "green"; text: string };
 
-export function autoFlags(client: ClientWithDetails): Flag[] {
+export function autoFlags(client: ClientWithCards): Flag[] {
   const flags: Flag[] = [];
   const util = overallUtilization(client.creditCards);
   const missing = parseMissingDocs(client.missingDocuments);

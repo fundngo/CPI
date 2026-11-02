@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { CreditKPICard } from "./CreditKPICard";
 import { CreditTable, type CreditTableColumn } from "./CreditTable";
+import { splitLatePayments } from "@shared/credit";
 import type {
   Client,
   ChargeOff,
@@ -83,19 +84,11 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
     publicRecords,
   } = data;
 
-  // 3-bucket split for late payments
-  const within12 = latePayments.filter((lp) => lp.withinTwelveMonths);
-  const between12And24 = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate > 0 && lp.monthsSinceLate <= 24
-  );
-  const older = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate > 24
-  );
-  // Catch any late payments not flagged within12 but with no monthsSinceLate set
-  const uncategorized = latePayments.filter(
-    (lp) => !lp.withinTwelveMonths && lp.monthsSinceLate === 0
-  );
-  const olderCombined = [...older, ...uncategorized];
+  // 3-bucket split for late payments (same rule as the server and the PDF)
+  const buckets = splitLatePayments(latePayments);
+  const within12 = buckets.within12;
+  const between12And24 = buckets["12to24"];
+  const olderCombined = buckets.over24;
 
   const hasAny =
     chargeOffs.length > 0 ||
@@ -125,8 +118,10 @@ export function CreditAnalysisView({ clientId }: { clientId: number }) {
   }
 
   const ageValue =
-    client.avgAccountAgeMonths > 0
-      ? `${client.avgAccountAgeYears} years ${client.avgAccountAgeMonths} months`
+    client.avgAccountAgeYears === 0 && client.avgAccountAgeMonths === 0
+      ? "—"
+      : client.avgAccountAgeMonths > 0
+      ? `${client.avgAccountAgeYears}y ${client.avgAccountAgeMonths}m`
       : `${client.avgAccountAgeYears} years`;
 
   const chargeOffCols: CreditTableColumn<ChargeOff>[] = [

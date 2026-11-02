@@ -21,16 +21,19 @@ Visit http://localhost:5000.
 
 ## Deploy to Railway
 
-1. Push this repo to GitHub.
-2. In Railway: **New Project → Deploy from GitHub repo → pick this repo**. Railway auto-detects Node and runs `npm ci && npm run build`, then `npm start`.
-3. In **Variables** add:
-   - `ANTHROPIC_API_KEY` — your Anthropic API key (required for PDF extraction)
-   - `NODE_ENV` — `production`
-   - `DATABASE_PATH` — `/data/data.db`
-4. In **Settings → Volumes** create a volume mounted at `/data`. This makes client data survive redeploys.
-5. In **Settings → Networking** click **Generate Domain** to get a public URL.
+Railway builds from the `Dockerfile` (see `railway.json`). The runtime image includes
+`poppler-utils`, which CPI uses to read scanned / encoded-font PDFs as images.
 
-That's it. Railway rebuilds automatically on every push to `main`.
+1. **New Project → Deploy from GitHub repo → `fundngo/CPI`.**
+2. In **Variables** add `ANTHROPIC_API_KEY` and `DATABASE_PATH=/data/data.db`
+   (optional: `CLAUDE_MODEL`).
+3. In **Settings → Volumes** attach a volume at `/data` so client data survives redeploys.
+   Don't add a `VOLUME` line to the Dockerfile — Railway rejects it.
+4. In **Settings → Networking** click **Generate Domain**.
+
+Every push to `main` redeploys. The health check is `GET /api/clients`.
+The **Settings** page in the app shows whether the API key, PDF image support, and the
+persistent volume are set up correctly.
 
 ---
 
@@ -51,8 +54,15 @@ Frontend and backend are served from the same Express process on `process.env.PO
 
 See [`.env.example`](./.env.example).
 
-| Var                 | Required | Notes                                                            |
-| ------------------- | -------- | ---------------------------------------------------------------- |
+| Var                 | Required | Notes                                                                 |
+| ------------------- | -------- | --------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY` | yes      | PDF credit-report / bank-statement extraction (Claude).               |
+| `CLAUDE_MODEL`      | no       | Defaults to `claude-sonnet-4-5`.                                      |
+| `PORT`              | no       | Defaults to 5000. Railway sets this automatically.                    |
+| `DATABASE_PATH`     | no       | Defaults to `./data.db`. Set to `/data/data.db` on Railway.           |
+| `SEED_DEMO_DATA`    | no       | Demo clients are seeded into an empty DB in development only. Set `true` to seed in production, `false` to skip in development. |
+
+------------------- | -------- | ---------------------------------------------------------------- |
 | `ANTHROPIC_API_KEY` | yes      | PDF credit-report auto-extraction (Claude).                      |
 | `PORT`              | no       | Defaults to 5000. Railway sets this automatically.               |
 | `DATABASE_PATH`     | no       | Defaults to `./data.db`. Set to `/data/data.db` on Railway.      |

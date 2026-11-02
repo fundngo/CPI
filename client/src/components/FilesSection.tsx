@@ -19,7 +19,6 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { useState } from "react";
 import { UpdateReviewModal } from "@/components/UpdateReviewModal";
 import { FILE_TYPES } from "@shared/schema";
 import type { FileType, UploadedFile } from "@shared/schema";
@@ -195,7 +194,7 @@ export function FilesSection({ clientId, files }: { clientId: number; files: Upl
           onClick={() => previewMutation.mutate()}
         >
           <RefreshCw className={`h-4 w-4 ${previewMutation.isPending ? "animate-spin" : ""}`} />
-          {previewMutation.isPending ? "Extracting…" : "Update from latest files"}
+          {previewMutation.isPending ? "Extracting…" : "Refresh from files"}
         </Button>
         <div className="text-xs text-muted-foreground">
           <Sparkles className="inline h-3 w-3 text-accent mr-1" />

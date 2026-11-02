@@ -445,7 +445,7 @@ export function UpdateReviewModal({
             {selectedCount} of {changedCount + (showUnchanged ? unchangedCount : 0)} selected
           </span>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => onOpenChange(false)}>
+            <Button variant="outline" onClick={() => onOpenChange(false)} data-testid="button-cancel-review">
               Cancel
             </Button>
             <Button
@@ -453,7 +453,7 @@ export function UpdateReviewModal({
               disabled={selectedCount === 0 || applyMutation.isPending}
               data-testid="button-apply-selected"
             >
-              {applyMutation.isPending ? "Applying…" : `Apply ${selectedCount} change${selectedCount === 1 ? "" : "s"}`}
+              {applyMutation.isPending ? "Applying…" : `Apply Selected (${selectedCount})`}
             </Button>
           </div>
         </DialogFooter>

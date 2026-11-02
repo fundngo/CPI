@@ -2,6 +2,12 @@ import type { Express, Request, Response } from "express";
 import type { Server } from "node:http";
 import { storage, seedIfEmpty } from "./storage";
 import {
+  formatBureauScores,
+  lateBucket,
+  normalizeAge,
+  validScore,
+} from "@shared/credit";
+import {
   insertClientSchema,
   updateClientSchema,
   insertCreditCardSchema,
@@ -10,15 +16,16 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 import Anthropic from "@anthropic-ai/sdk";
+// pdf-parse v2 exports a PDFParse class with .getText() (ESM + CJS builds)
+import { PDFParse } from "pdf-parse";
 import { renderPdfToPngs } from "./pdfVision";
+import { spawnSync } from "node:child_process";
 
 // Use real Anthropic model id (with dashes). The previous code used the LLM
 // API gateway alias "claude_sonnet_4_5" which only works inside the sandbox,
 // not against real api.anthropic.com. Configurable via env for easy upgrades.
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-5";
-// pdf-parse v2 exports a PDFParse class with .getText()
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { PDFParse } = require("pdf-parse");
+
 
 export async function registerRoutes(
   httpServer: Server,
@@ -117,8 +124,15 @@ export async function registerRoutes(
     return trimmed;
   }
 
+  function anthropicClient(): Anthropic {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      throw new Error("AI extraction is not configured: ANTHROPIC_API_KEY is not set on the server.");
+    }
+    return new Anthropic();
+  }
+
   async function claudeJson(systemPrompt: string, userText: string): Promise<any> {
-    const client = new Anthropic();
+    const client = anthropicClient();
     const message = await client.messages.create({
       model: CLAUDE_MODEL as any,
       max_tokens: 16000,
@@ -158,7 +172,7 @@ export async function registerRoutes(
   // Vision-based extraction: send PDF pages as images so Claude can read PDFs
   // with encoded/CID fonts (Funding Suite, MyFICO exports, scanned PDFs).
   async function claudeJsonFromImages(systemPrompt: string, userText: string, pages: { base64Png: string }[]): Promise<any> {
-    const client = new Anthropic();
+    const client = anthropicClient();
     const content: any[] = [{ type: "text", text: userText }];
     for (const p of pages) {
       content.push({
@@ -216,7 +230,9 @@ export async function registerRoutes(
       pages = await renderPdfToPngs(base64, { maxPages: 12, scale: 1.5 });
     } catch (e: any) {
       console.error("[extractFromPdf] PDF render failed:", e);
-      throw new Error(`Vision fallback failed to render PDF: ${e?.message || "unknown error"}. Original text error: ${error || "none"}`);
+      throw new Error(
+        `${error || "This PDF has no readable text."} We also tried reading the pages as images, but the PDF could not be rendered. It may be password-protected or corrupted.`,
+      );
     }
     if (!pages.length) {
       throw new Error("PDF has no pages to read (vision fallback)");
@@ -227,7 +243,9 @@ export async function registerRoutes(
       return { parsed, method: "vision" };
     } catch (e: any) {
       console.error("[extractFromPdf] Vision Claude call failed:", e);
-      throw new Error(`Vision extraction failed: ${e?.message || "unknown error"}`);
+      throw new Error(
+        `This PDF is scanned or uses encoded fonts, so we read it as images — but that also failed (${e?.message || "unknown error"}). Try a different export of the report, or enter the client manually.`,
+      );
     }
   }
 
@@ -377,28 +395,65 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
       .join(" ");
   }
 
+  /**
+   * Safety net applied to every credit-report extraction (New Client and
+   * Refresh-from-files): blank placeholder names/addresses, keep only valid
+   * 300–850 scores, recompute the mid-score, and keep avg-age months 0–11.
+   */
+  function postProcessCreditReport(parsed: any, fileName?: string): any {
+    const out = parsed && typeof parsed === "object" ? parsed : {};
+    const cleanName = sanitizePlaceholder(out.name, NAME_PLACEHOLDER_PATTERNS);
+    out.name = cleanName || deriveNameFromFilename(fileName);
+    out.address = sanitizePlaceholder(out.address, ADDR_PLACEHOLDER_PATTERNS);
+    const b = out.bureauScores || {};
+    out.bureauScores = {
+      equifax: validScore(b.equifax),
+      experian: validScore(b.experian),
+      transunion: validScore(b.transunion),
+    };
+    // Mortgage mid-score: middle of 3, lower of 2, the only one of 1.
+    const entries = (
+      [
+        ["Equifax", out.bureauScores.equifax],
+        ["Experian", out.bureauScores.experian],
+        ["TransUnion", out.bureauScores.transunion],
+      ] as Array<[string, number | null]>
+    ).filter(([, v]) => v != null) as Array<[string, number]>;
+    entries.sort((x, y) => x[1] - y[1]);
+    if (entries.length === 3) [out.creditScoreSource, out.creditScore] = entries[1];
+    else if (entries.length >= 1) [out.creditScoreSource, out.creditScore] = entries[0];
+    else {
+      out.creditScore = validScore(out.creditScore);
+      if (out.creditScore == null) out.creditScoreSource = null;
+    }
+    if (out.avgAccountAge) out.avgAccountAge = normalizeAge(out.avgAccountAge.years, out.avgAccountAge.months);
+    for (const k of ["creditCards", "chargeOffs", "collections", "latePayments", "repossessions", "publicRecords", "allAccounts"]) {
+      if (!Array.isArray(out[k])) out[k] = [];
+    }
+    return out;
+  }
+
+  const extractBodySchema = z.object({
+    fileBase64: z.string().min(1, "Missing fileBase64"),
+    fileName: z.string().optional(),
+  });
+
   // Extract client data from a credit-report PDF (used by Add Client flow)
   app.post("/api/extract-credit-report", async (req: Request, res: Response) => {
+    const body = extractBodySchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ message: "Missing fileBase64", errors: body.error.errors });
+    const { fileBase64, fileName } = body.data;
     try {
-      const { fileBase64, fileName } = req.body as { fileBase64?: string; fileName?: string };
-      if (!fileBase64) return res.status(400).json({ message: "Missing fileBase64" });
       const { parsed, method } = await extractFromPdf(
         fileBase64,
         CREDIT_REPORT_SCHEMA_PROMPT,
         (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
         `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
       );
-      console.log(`[extract-credit-report] method=${method} fileName=${fileName || "(none)"}`);
-      // Strip known placeholders
-      const cleanName = sanitizePlaceholder(parsed?.name, NAME_PLACEHOLDER_PATTERNS);
-      const cleanAddress = sanitizePlaceholder(parsed?.address, ADDR_PLACEHOLDER_PATTERNS);
-      // If name came back empty after stripping, try to derive from filename
-      const fallbackName = cleanName || deriveNameFromFilename(fileName);
-      parsed.name = fallbackName;
-      parsed.address = cleanAddress;
-      res.json({ extracted: parsed, fileName: fileName || "credit-report.pdf" });
+      console.log(`[extract-credit-report] method=${method}`);
+      res.json({ extracted: postProcessCreditReport(parsed, fileName), method, fileName: fileName || "credit-report.pdf" });
     } catch (e: any) {
-      console.error("Extract error:", e);
+      console.error("Extract error:", e?.message || e);
       res.status(500).json({ message: e?.message || "Extraction failed" });
     }
   });
@@ -442,37 +497,36 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     businessAccountsList: { label: "Business Bank Accounts", section: "Banking", format: "text" },
   };
 
-  // Build the credit-report patch + parsed payload
-  async function buildCreditReportPatch(parsed: any) {
+  // Build the scalar client patch implied by an extracted credit report.
+  function buildCreditReportPatch(parsed: any) {
     const patch: any = {};
-    // Prefer the tri-bureau breakdown when available (mortgage tri-merge reports)
     const b = parsed.bureauScores || {};
-    const triParts: string[] = [];
-    if (b.equifax != null) triParts.push(`Equifax ${b.equifax}`);
-    if (b.experian != null) triParts.push(`Experian ${b.experian}`);
-    if (b.transunion != null) triParts.push(`TransUnion ${b.transunion}`);
-    if (b.equifax != null) patch.equifaxScore = b.equifax;
-    if (b.experian != null) patch.experianScore = b.experian;
-    if (b.transunion != null) patch.transunionScore = b.transunion;
-    if (triParts.length >= 2) {
-      patch.recentCreditReport = triParts.join(", ");
-    } else if (parsed.creditScore != null && parsed.creditScoreSource) {
-      patch.recentCreditReport = `${parsed.creditScore} (${parsed.creditScoreSource})`;
-    } else if (parsed.creditScore != null) {
-      patch.recentCreditReport = String(parsed.creditScore);
+    const eq = validScore(b.equifax);
+    const ex = validScore(b.experian);
+    const tu = validScore(b.transunion);
+    if (eq != null) patch.equifaxScore = eq;
+    if (ex != null) patch.experianScore = ex;
+    if (tu != null) patch.transunionScore = tu;
+    const tri = formatBureauScores({ equifax: eq, experian: ex, transunion: tu });
+    if (tri) patch.recentCreditReport = tri;
+    else if (validScore(parsed.creditScore) != null) {
+      patch.recentCreditReport = parsed.creditScoreSource
+        ? `${parsed.creditScore} (${parsed.creditScoreSource})`
+        : String(parsed.creditScore);
     }
-    if (parsed.totalAccountsCount != null) patch.totalAccountsCount = Number(parsed.totalAccountsCount) || 0;
+    if (parsed.totalAccountsCount != null) patch.totalAccountsCount = Math.max(0, Math.round(Number(parsed.totalAccountsCount) || 0));
     if (parsed.oldestAccount) {
-      patch.oldestAccountCreditor = parsed.oldestAccount.creditor || "";
-      patch.oldestAccountYear = Number(parsed.oldestAccount.year) || 0;
+      patch.oldestAccountCreditor = String(parsed.oldestAccount.creditor || "");
+      patch.oldestAccountYear = Math.round(Number(parsed.oldestAccount.year) || 0);
     }
     if (parsed.newestAccount) {
-      patch.newestAccountCreditor = parsed.newestAccount.creditor || "";
-      patch.newestAccountYear = Number(parsed.newestAccount.year) || 0;
+      patch.newestAccountCreditor = String(parsed.newestAccount.creditor || "");
+      patch.newestAccountYear = Math.round(Number(parsed.newestAccount.year) || 0);
     }
     if (parsed.avgAccountAge) {
-      patch.avgAccountAgeYears = Number(parsed.avgAccountAge.years) || 0;
-      patch.avgAccountAgeMonths = Number(parsed.avgAccountAge.months) || 0;
+      const age = normalizeAge(parsed.avgAccountAge.years, parsed.avgAccountAge.months);
+      patch.avgAccountAgeYears = age.years;
+      patch.avgAccountAgeMonths = age.months;
     }
     patch.chargeOffsCount = (parsed.chargeOffs || []).length;
     patch.collectionsCount = (parsed.collections || []).length;
@@ -480,13 +534,16 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     patch.publicRecordsCount = (parsed.publicRecords || []).length;
     const lp = (parsed.latePayments || []) as any[];
     patch.latePaymentsCount = lp.length;
-    patch.latePaymentsWithin12moCount = lp.filter((l) => l.withinTwelveMonths || (l.monthsSinceLate != null && l.monthsSinceLate <= 12)).length;
-    patch.latePayments12to24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 12 && l.monthsSinceLate <= 24).length;
-    patch.latePaymentsOlder24moCount = lp.filter((l) => l.monthsSinceLate != null && l.monthsSinceLate > 24).length;
-    const cards = (parsed.creditCards || []) as any[];
+    patch.latePaymentsWithin12moCount = lp.filter((l) => lateBucket(l) === "within12").length;
+    patch.latePayments12to24moCount = lp.filter((l) => lateBucket(l) === "12to24").length;
+    patch.latePaymentsOlder24moCount = lp.filter((l) => lateBucket(l) === "over24").length;
+    // Utilization counts open cards only (not Closed / Charged Off)
+    const cards = ((parsed.creditCards || []) as any[]).filter(
+      (c) => !/closed|charged/i.test(String(c.accountStatus || "")),
+    );
     const totalLimit = cards.reduce((s, c) => s + (Number(c.creditLimit) || 0), 0);
     const totalBal = cards.reduce((s, c) => s + (Number(c.currentBalance) || 0), 0);
-    if (totalLimit > 0) patch.creditUtilization = Math.round((totalBal / totalLimit) * 100);
+    if (totalLimit > 0) patch.creditUtilization = Math.round((totalBal / totalLimit) * 1000) / 10;
     patch.creditAnalysisDate = new Date().toISOString().slice(0, 10);
     return patch;
   }
@@ -548,24 +605,32 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
         const fullFile = await storage.getFile(latestCreditReport.id);
         const base64 = (fullFile as any)?.base64Content;
         if (!base64) throw new Error("Credit report file has no content stored");
-        const { parsed, method } = await extractFromPdf(
+        const { parsed: rawParsed, method } = await extractFromPdf(
           base64,
           CREDIT_REPORT_SCHEMA_PROMPT,
           (pdfText) => `Extract client data from this credit report text. Return ONLY the JSON object per the schema.\n\n--- CREDIT REPORT TEXT ---\n${pdfText}\n--- END ---`,
           `Extract client data from this credit report. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
         );
-        console.log(`[preview-credit-report] method=${method} fileName=${latestCreditReport.fileName}`);
-        const patch = await buildCreditReportPatch(parsed);
+        console.log(`[preview-credit-report] method=${method}`);
+        const parsed = postProcessCreditReport(rawParsed, latestCreditReport.fileName);
+        const patch = buildCreditReportPatch(parsed);
         const fieldDiffs = diffPatch(client, patch);
-        // Table-level diffs: just count comparisons
+        // Table-level diffs: compare row counts against what is stored now
+        const [curCO, curCol, curLP, curRepo, curPR] = await Promise.all([
+          storage.listChargeOffs(clientId),
+          storage.listCollections(clientId),
+          storage.listLatePayments(clientId),
+          storage.listRepossessions(clientId),
+          storage.listPublicRecords(clientId),
+        ]);
         const tableDiffs: any[] = [];
         const tableSpecs: Array<[string, string, any[], number]> = [
-          ["__cards", "Credit Cards (replace all)", parsed.creditCards || [], (client as any).creditCards?.length || 0],
-          ["__chargeOffs", "Charge-Offs (replace all)", parsed.chargeOffs || [], (client as any).chargeOffs?.length || 0],
-          ["__collections", "Collections (replace all)", parsed.collections || [], (client as any).collections?.length || 0],
-          ["__latePayments", "Late Payments (replace all)", parsed.latePayments || [], (client as any).latePayments?.length || 0],
-          ["__repossessions", "Repossessions (replace all)", parsed.repossessions || [], (client as any).repossessions?.length || 0],
-          ["__publicRecords", "Public Records (replace all)", parsed.publicRecords || [], (client as any).publicRecords?.length || 0],
+          ["__cards", "Credit Cards (replace all)", parsed.creditCards, client.creditCards.length],
+          ["__chargeOffs", "Charge-Offs (replace all)", parsed.chargeOffs, curCO.length],
+          ["__collections", "Collections (replace all)", parsed.collections, curCol.length],
+          ["__latePayments", "Late Payments (replace all)", parsed.latePayments, curLP.length],
+          ["__repossessions", "Repossessions (replace all)", parsed.repossessions, curRepo.length],
+          ["__publicRecords", "Public Records (replace all)", parsed.publicRecords, curPR.length],
         ];
         for (const [key, label, newList, currentCount] of tableSpecs) {
           tableDiffs.push({
@@ -599,7 +664,7 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
           (pdfText) => `Extract bank account info from this statement text. Return ONLY the JSON object per the schema.\n\n--- BANK STATEMENT TEXT ---\n${pdfText}\n--- END ---`,
           `Extract bank account info from this statement. The pages are attached as images — read the text directly from the images. Return ONLY the JSON object per the schema, no markdown, no commentary.`,
         );
-        console.log(`[preview-bank-statement] method=${method} fileName=${latestBankStatement.fileName}`);
+        console.log(`[preview-bank-statement] method=${method}`);
         const { patch, isBiz, accounts } = buildBankPatch(parsed);
         const diffs = diffPatch(client, patch);
         out.bankStatement = {
@@ -623,86 +688,77 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     res.json(out);
   });
 
-  // APPLY: receive selected fields + parsed payloads, write to DB
+  const applyBodySchema = z.object({
+    acceptedKeys: z.array(z.string()),
+    creditReportParsed: z.record(z.any()).nullish(),
+    bankStatementParsed: z.record(z.any()).nullish(),
+  });
+
+  // APPLY: receive selected fields + parsed payloads, write ONLY accepted keys
   app.post("/api/clients/:id/apply-from-files", async (req: Request, res: Response) => {
     const clientId = Number(req.params.id);
     if (!Number.isFinite(clientId)) return res.status(400).json({ message: "Invalid id" });
+    const body = applyBodySchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ message: "Invalid", errors: body.error.errors });
     const client = await storage.getClient(clientId);
     if (!client) return res.status(404).json({ message: "Client not found" });
 
-    const { acceptedKeys, creditReportParsed, bankStatementParsed } = req.body as {
-      acceptedKeys: string[];
-      creditReportParsed?: any;
-      bankStatementParsed?: any;
-    };
-    if (!Array.isArray(acceptedKeys)) return res.status(400).json({ message: "acceptedKeys required" });
+    const { acceptedKeys, bankStatementParsed } = body.data;
     const accept = new Set(acceptedKeys);
+    const patch: Record<string, any> = {};
+    const tables: Record<string, any[]> = {};
 
-    // Credit report scalar patch
-    if (creditReportParsed) {
-      const fullPatch = await buildCreditReportPatch(creditReportParsed);
-      const filtered: any = {};
-      for (const k of Object.keys(fullPatch)) if (accept.has(k)) filtered[k] = fullPatch[k];
-      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
-
-      // Table replacements: only if user accepted that table
-      if (accept.has("__cards")) {
-        await storage.replaceCards(clientId, (creditReportParsed.creditCards || []).map((c: any) => ({
-          cardName: c.cardName || "", issuer: c.issuer || "",
-          creditLimit: Number(c.creditLimit) || 0, currentBalance: Number(c.currentBalance) || 0,
-          minimumPayment: c.minimumPayment != null ? Number(c.minimumPayment) : null,
-          paymentDueDate: c.paymentDueDate || "", accountStatus: c.accountStatus || "Current", notes: "",
-        })));
-      }
-      if (accept.has("__chargeOffs")) {
-        await storage.replaceChargeOffs(clientId, (creditReportParsed.chargeOffs || []).map((c: any) => ({
-          creditor: c.creditor || "", accountType: c.accountType || "",
-          originalAmount: Number(c.originalAmount) || 0, balance: Number(c.balance) || 0,
-          openedDate: c.openedDate || "", closedDate: c.closedDate || "", notes: "",
-        })));
-      }
-      if (accept.has("__collections")) {
-        await storage.replaceCollections(clientId, (creditReportParsed.collections || []).map((c: any) => ({
-          creditor: c.creditor || "", originalCreditor: c.originalCreditor || "",
-          balance: Number(c.balance) || 0, reportedDate: c.reportedDate || "", notes: "",
-        })));
-      }
-      if (accept.has("__latePayments")) {
-        await storage.replaceLatePayments(clientId, (creditReportParsed.latePayments || []).map((l: any) => ({
-          creditor: l.creditor || "", accountType: l.accountType || "",
-          status: l.status || "Open", mostRecentLateDate: l.mostRecentLateDate || "",
-          lateHistory: l.lateHistory || "",
-          withinTwelveMonths: !!l.withinTwelveMonths,
-          monthsSinceLate: Number(l.monthsSinceLate) || 0,
-        })));
-      }
-      if (accept.has("__repossessions")) {
-        await storage.replaceRepossessions(clientId, (creditReportParsed.repossessions || []).map((r: any) => ({
-          creditor: r.creditor || "", accountType: r.accountType || "",
-          originalAmount: Number(r.originalAmount) || 0, balance: Number(r.balance) || 0,
-          openedDate: r.openedDate || "", repoDate: r.repoDate || "",
-          status: r.status || "", notes: "",
-        })));
-      }
-      if (accept.has("__publicRecords")) {
-        await storage.replacePublicRecords(clientId, (creditReportParsed.publicRecords || []).map((p: any) => ({
-          recordType: (p.recordType || "Other"),
-          courtOrAgency: p.courtOrAgency || "", referenceNumber: p.referenceNumber || "",
-          amount: Number(p.amount) || 0, status: p.status || "",
-          filedDate: p.filedDate || "", notes: "",
-        })));
-      }
+    if (body.data.creditReportParsed) {
+      const cr = postProcessCreditReport(body.data.creditReportParsed);
+      const full = buildCreditReportPatch(cr);
+      for (const k of Object.keys(full)) if (accept.has(k)) patch[k] = full[k];
+      const tableKeys: Array<[string, string]> = [
+        ["__cards", "creditCards"],
+        ["__chargeOffs", "chargeOffs"],
+        ["__collections", "collections"],
+        ["__latePayments", "latePayments"],
+        ["__repossessions", "repossessions"],
+        ["__publicRecords", "publicRecords"],
+      ];
+      for (const [key, field] of tableKeys) if (accept.has(key)) tables[field] = cr[field];
     }
 
     if (bankStatementParsed) {
-      const { patch } = buildBankPatch(bankStatementParsed);
-      const filtered: any = {};
-      for (const k of Object.keys(patch)) if (accept.has(k)) filtered[k] = patch[k];
-      if (Object.keys(filtered).length > 0) await storage.updateClient(clientId, filtered);
+      const { patch: bankPatch } = buildBankPatch(bankStatementParsed);
+      for (const k of Object.keys(bankPatch)) if (accept.has(k)) patch[k] = bankPatch[k];
     }
 
+    // Keep the legacy score text in sync with the final (merged) bureau scores.
+    if (["equifaxScore", "experianScore", "transunionScore", "recentCreditReport"].some((k) => k in patch)) {
+      const merged = formatBureauScores({
+        equifax: "equifaxScore" in patch ? patch.equifaxScore : client.equifaxScore,
+        experian: "experianScore" in patch ? patch.experianScore : client.experianScore,
+        transunion: "transunionScore" in patch ? patch.transunionScore : client.transunionScore,
+      });
+      if (merged) patch.recentCreditReport = merged;
+    }
+
+    const validated = updateClientSchema.safeParse(patch);
+    if (!validated.success) return res.status(400).json({ message: "Invalid", errors: validated.error.errors });
+    storage.applyExtractedUpdate(clientId, validated.data, tables);
     const refreshed = await storage.getClient(clientId);
     res.json({ ok: true, client: refreshed });
+  });
+
+  // Basic app info for the Settings page (no secrets).
+  app.get("/api/app-info", (_req: Request, res: Response) => {
+    let visionAvailable = false;
+    try {
+      visionAvailable = spawnSync("pdftoppm", ["-v"]).error == null;
+    } catch {}
+    const dbPath = process.env.DATABASE_PATH || "data.db";
+    res.json({
+      aiConfigured: !!process.env.ANTHROPIC_API_KEY,
+      model: CLAUDE_MODEL,
+      visionAvailable,
+      persistentStorage: dbPath.startsWith("/data/"),
+      environment: process.env.NODE_ENV || "development",
+    });
   });
 
   app.get("/api/clients", async (_req: Request, res: Response) => {
@@ -718,81 +774,25 @@ If unknown, use null/empty/0 as appropriate. Return ONLY the JSON object.`;
     res.json(client);
   });
 
+  const fileBodySchema = insertUploadedFileSchema.omit({ clientId: true });
+  const createClientBodySchema = insertClientSchema.extend({
+    creditCards: z.array(z.record(z.any())).optional(),
+    chargeOffs: z.array(z.record(z.any())).optional(),
+    collections: z.array(z.record(z.any())).optional(),
+    latePayments: z.array(z.record(z.any())).optional(),
+    repossessions: z.array(z.record(z.any())).optional(),
+    publicRecords: z.array(z.record(z.any())).optional(),
+    file: fileBodySchema.optional(),
+  });
+
   app.post("/api/clients", async (req: Request, res: Response) => {
-    try {
-      // Allow optional credit-analysis sub-arrays in the same payload
-      const { chargeOffs: incomingChargeOffs, collections: incomingCollections, latePayments: incomingLatePayments, repossessions: incomingRepossessions, publicRecords: incomingPublicRecords, ...clientFields } = (req.body || {}) as any;
-      const data = insertClientSchema.parse(clientFields);
-      const created = await storage.createClient(data);
-      if (Array.isArray(incomingChargeOffs)) {
-        for (const c of incomingChargeOffs) {
-          await storage.addChargeOff(created.id, {
-            creditor: c.creditor || "",
-            accountType: c.accountType || "",
-            originalAmount: Number(c.originalAmount) || 0,
-            balance: Number(c.balance) || 0,
-            openedDate: c.openedDate || "",
-            closedDate: c.closedDate || "",
-            notes: c.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingCollections)) {
-        for (const c of incomingCollections) {
-          await storage.addCollection(created.id, {
-            creditor: c.creditor || "",
-            originalCreditor: c.originalCreditor || "",
-            balance: Number(c.balance) || 0,
-            reportedDate: c.reportedDate || "",
-            notes: c.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingLatePayments)) {
-        for (const l of incomingLatePayments) {
-          await storage.addLatePayment(created.id, {
-            creditor: l.creditor || "",
-            accountType: l.accountType || "",
-            status: l.status || "Open",
-            mostRecentLateDate: l.mostRecentLateDate || "",
-            lateHistory: l.lateHistory || "",
-            withinTwelveMonths: !!l.withinTwelveMonths,
-            monthsSinceLate: Number(l.monthsSinceLate) || 0,
-          } as any);
-        }
-      }
-      if (Array.isArray(incomingRepossessions)) {
-        for (const r of incomingRepossessions) {
-          await storage.addRepossession(created.id, {
-            creditor: r.creditor || "",
-            accountType: r.accountType || "",
-            originalAmount: Number(r.originalAmount) || 0,
-            balance: Number(r.balance) || 0,
-            openedDate: r.openedDate || "",
-            repoDate: r.repoDate || "",
-            status: r.status || "",
-            notes: r.notes || "",
-          });
-        }
-      }
-      if (Array.isArray(incomingPublicRecords)) {
-        for (const p of incomingPublicRecords) {
-          await storage.addPublicRecord(created.id, {
-            recordType: (p.recordType || "Other") as any,
-            courtOrAgency: p.courtOrAgency || "",
-            referenceNumber: p.referenceNumber || "",
-            amount: Number(p.amount) || 0,
-            status: p.status || "",
-            filedDate: p.filedDate || "",
-            notes: p.notes || "",
-          });
-        }
-      }
-      res.status(201).json(created);
-    } catch (e: any) {
-      if (e instanceof z.ZodError) return res.status(400).json({ message: "Invalid", errors: e.errors });
-      throw e;
-    }
+    const body = createClientBodySchema.safeParse(req.body || {});
+    if (!body.success) return res.status(400).json({ message: "Invalid", errors: body.error.errors });
+    const { creditCards, chargeOffs, collections, latePayments, repossessions, publicRecords, file, ...clientFields } = body.data;
+    const created = storage.createClientWithDetails(clientFields, {
+      creditCards, chargeOffs, collections, latePayments, repossessions, publicRecords, file,
+    });
+    res.status(201).json(created);
   });
 
   app.get("/api/clients/:id/credit-analysis", async (req: Request, res: Response) => {

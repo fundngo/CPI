@@ -239,6 +239,10 @@ export type InsertRepossession = z.infer<typeof insertRepossessionSchema>;
 export type PublicRecord = typeof publicRecords.$inferSelect;
 export type InsertPublicRecord = z.infer<typeof insertPublicRecordSchema>;
 
+export type ClientWithCards = Client & {
+  creditCards: CreditCard[];
+};
+
 export type ClientWithDetails = Client & {
   creditCards: CreditCard[];
   files: UploadedFile[];

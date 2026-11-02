@@ -1,4 +1,5 @@
 import jsPDF from "jspdf";
+import { splitLatePayments } from "@shared/credit";
 import type {
   ClientWithDetails,
   ChargeOff,
@@ -19,22 +20,23 @@ import logoUrl from "@/assets/fund-go-logo.png";
 import {
   autoRecommendedSteps,
   businessBankingStrength,
-  businessRevenueStatus,
+  businessRevenueStatusFor,
   cardUtilization,
   fmtCurrency,
   fmtDate,
   fmtPct,
   fundingReadinessScore,
+  isActiveCard,
   overallUtilization,
   parseMissingDocs,
-  paydownTo,
+  paydownSummary,
   personalBankingStrength,
   readinessLabel,
   targetBalanceAt,
   totalBalance,
   totalCreditLimit,
   utilBucket,
-  utilizationStatus,
+  utilizationStatusFor,
 } from "./calculations";
 
 // Hex → [r,g,b] for jsPDF (which only accepts numeric color triples).
@@ -60,28 +62,43 @@ export function generateClientPdf(
   const doc = new jsPDF({ unit: "pt", format: "letter" });
   const W = doc.internal.pageSize.getWidth();
   const H = doc.internal.pageSize.getHeight();
-  const margin = 48;
+  const margin = 36;
+  const bottomLimit = H - 44; // keep clear of the footer
   let y = margin;
 
-  const navy: [number, number, number] = [20, 38, 76];
-  const slate: [number, number, number] = [100, 110, 130];
-  const emerald: [number, number, number] = [40, 158, 110];
+  const navy: [number, number, number] = [10, 46, 73]; // #0a2e49
+  const slate: [number, number, number] = [90, 100, 120];
+  const brandGreen: [number, number, number] = [58, 204, 58]; // #3acc3a
   const muted: [number, number, number] = [240, 242, 247];
+  const STATUS_RGB = {
+    green: [22, 163, 74] as [number, number, number],
+    amber: [217, 119, 6] as [number, number, number],
+    red: [220, 38, 38] as [number, number, number],
+  };
 
-  function ensure(space: number) {
-    if (y + space > H - margin) {
+  const ensure = (space: number) => {
+    if (y + space > bottomLimit) {
       doc.addPage();
       y = margin;
     }
-  }
+  };
+
+  // Truncate text with an ellipsis so it never runs into the next column.
+  const truncateToWidth = (text: string, maxW: number): string => {
+    let t = text;
+    if (doc.getTextWidth(t) <= maxW) return t;
+    while (t.length > 1 && doc.getTextWidth(t + "\u2026") > maxW) t = t.slice(0, -1);
+    return t + "\u2026";
+  };
 
   // Brand header with logo
   doc.setFillColor(...navy);
-  doc.rect(0, 0, W, 72, "F");
+  doc.rect(0, 0, W, 68, "F");
   doc.setTextColor(255, 255, 255);
   // Logo (PNG) — aspect-preserved height ~40pt, left-aligned in header
   try {
-    doc.addImage(logoUrl, "PNG", margin, 16, 160, 40, undefined, "FAST");
+    // Logo is ~4.76:1 — keep its aspect ratio.
+    doc.addImage(logoUrl, "PNG", margin, 16, 36 * 4.76, 36, undefined, "FAST");
   } catch {
     // Fallback to text if image fails
     doc.setFont("helvetica", "bold");
@@ -90,14 +107,14 @@ export function generateClientPdf(
   }
   doc.setFont("helvetica", "normal");
   doc.setFontSize(9);
-  doc.text("Client Profile Intake — Confidential", W - margin, 32, { align: "right" });
-  doc.text(`Generated ${new Date().toLocaleDateString()}`, W - margin, 50, { align: "right" });
+  doc.text("Client Profile Intake \u2013 Confidential", W - margin, 30, { align: "right" });
+  doc.text(`Generated ${new Date().toLocaleDateString("en-US")}`, W - margin, 46, { align: "right" });
 
-  y = 96;
-  doc.setTextColor(20, 38, 76);
+  y = 94;
+  doc.setTextColor(...navy);
   doc.setFont("helvetica", "bold");
   doc.setFontSize(20);
-  doc.text(client.name, margin, y);
+  doc.text(client.name || "Unnamed Client", margin, y);
   y += 22;
 
   doc.setFont("helvetica", "normal");
@@ -139,7 +156,7 @@ export function generateClientPdf(
   doc.text("BUSINESS BANKING", colX(2), y + 22);
   doc.text("OVERALL UTILIZATION", colX(3), y + 22);
 
-  doc.setTextColor(...navy);
+  doc.setTextColor(...(score >= 80 ? STATUS_RGB.green : score >= 50 ? STATUS_RGB.amber : STATUS_RGB.red));
   doc.setFontSize(22);
   doc.text(`${score}`, colX(0), y + 52);
   doc.setFontSize(11);
@@ -147,38 +164,32 @@ export function generateClientPdf(
   doc.setTextColor(...slate);
   doc.text(scoreLabel, colX(0), y + 70);
 
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(22);
-  doc.setTextColor(...navy);
-  const pbsX = colX(1);
-  doc.text(`${pbs}`, pbsX, y + 52);
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(10);
-  doc.setTextColor(...slate);
-  doc.text("/ 100", pbsX + 30, y + 52);
+  const outOf100 = (value: number, x: number) => {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(22);
+    doc.setTextColor(...navy);
+    doc.text(`${value}`, x, y + 52);
+    const w = doc.getTextWidth(`${value}`);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(...slate);
+    doc.text("/ 100", x + w + 4, y + 52);
+  };
+  outOf100(pbs, colX(1));
+  outOf100(bbs, colX(2));
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(22);
-  doc.setTextColor(...navy);
-  const bbsX = colX(2);
-  doc.text(`${bbs}`, bbsX, y + 52);
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(10);
-  doc.setTextColor(...slate);
-  doc.text("/ 100", bbsX + 30, y + 52);
-
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(22);
-  doc.setTextColor(util >= 50 ? 200 : util >= 30 ? 220 : 40, util >= 50 ? 50 : util >= 30 ? 140 : 158, util >= 50 ? 50 : util >= 30 ? 30 : 110);
+  doc.setTextColor(...(util < 30 ? STATUS_RGB.green : util < 50 ? STATUS_RGB.amber : STATUS_RGB.red));
   doc.text(`${util.toFixed(0)}%`, colX(3), y + 52);
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...slate);
-  doc.text(utilizationStatus(util), colX(3), y + 70);
+  doc.text(utilizationStatusFor(client), colX(3), y + 70);
 
   y += 108;
 
-  function sectionHeader(title: string) {
+  const sectionHeader = (title: string) => {
     ensure(40);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(12);
@@ -187,7 +198,7 @@ export function generateClientPdf(
     // Underline spans the full width of the title text
     const titleWidth = doc.getTextWidth(title);
     y += 6;
-    doc.setDrawColor(...emerald);
+    doc.setDrawColor(...brandGreen);
     doc.setLineWidth(2);
     doc.line(margin, y, margin + titleWidth, y);
     doc.setLineWidth(1);
@@ -195,9 +206,9 @@ export function generateClientPdf(
     doc.setTextColor(...slate);
     doc.setFont("helvetica", "normal");
     doc.setFontSize(10);
-  }
+  };
 
-  function kvLine(k: string, v: string) {
+  const kvLine = (k: string, v: string) => {
     ensure(16);
     doc.setFont("helvetica", "bold");
     doc.setTextColor(...navy);
@@ -207,7 +218,7 @@ export function generateClientPdf(
     const lines = doc.splitTextToSize(v || "—", W - margin * 2 - 150);
     doc.text(lines, margin + 150, y);
     y += Math.max(14, lines.length * 12);
-  }
+  };
 
   sectionHeader("Personal Banking");
   kvLine("Bank Accounts", `${client.numBankAccounts} accounts`);
@@ -221,7 +232,7 @@ export function generateClientPdf(
   if (client.experianScore != null) triBureauLines.push(`Experian ${client.experianScore}`);
   if (client.transunionScore != null) triBureauLines.push(`TransUnion ${client.transunionScore}`);
   if (triBureauLines.length > 0) {
-    kvLine("Credit Report", triBureauLines.join("  \u2022  "));
+    kvLine("Credit Report", triBureauLines.join(" \u2022 "));
   } else if (client.recentCreditReport) {
     kvLine("Credit Report", client.recentCreditReport);
   }
@@ -235,7 +246,7 @@ export function generateClientPdf(
   kvLine("Generating Revenue", client.generatingRevenue ? "Yes" : "No");
   kvLine("Monthly Revenue", fmtCurrency(client.monthlyRevenue));
   kvLine("Annual Revenue", fmtCurrency(client.annualRevenue));
-  kvLine("Revenue Status", businessRevenueStatus(client.monthlyRevenue));
+  kvLine("Revenue Status", businessRevenueStatusFor(client));
   kvLine("Business Credit Cards", client.businessCreditCards);
   kvLine("Business Loans", client.businessLoans);
   kvLine("Lines of Credit", client.businessLinesOfCredit);
@@ -243,14 +254,31 @@ export function generateClientPdf(
   if (client.businessNotes) kvLine("Notes", client.businessNotes);
   y += 8;
 
+  // Keep the whole Credit Utilization section (heading, totals, table, paydown
+  // box) on one page when it fits, so the TOTALS row is never orphaned.
+  {
+    const cardsH = client.creditCards.length ? 22 + 20 + client.creditCards.length * 16 + 18 + 84 : 0;
+    const sectionH = 40 + 4 * 14 + 4 + cardsH;
+    if (y + sectionH > bottomLimit && margin + sectionH <= bottomLimit) {
+      doc.addPage();
+      y = margin;
+    }
+  }
   sectionHeader("Credit Utilization");
-  kvLine("Total Cards", `${client.creditCards.length}`);
+  kvLine("Open Cards", `${client.creditCards.filter(isActiveCard).length}`);
   kvLine("Total Credit Limit", fmtCurrency(totalCreditLimit(client.creditCards)));
   kvLine("Total Balance", fmtCurrency(totalBalance(client.creditCards)));
-  kvLine("Overall Utilization", `${fmtPct(util, 1)} (${utilizationStatus(util)})`);
+  kvLine("Overall Utilization", `${fmtPct(util, 1)} (${utilizationStatusFor(client)})`);
   y += 4;
 
   if (client.creditCards.length) {
+    // Fallback for very long card lists: at least start the table on a fresh
+    // page rather than splitting right after the legend.
+    const blockH = 22 + 20 + client.creditCards.length * 16 + 18 + 84;
+    if (y + 6 + blockH > bottomLimit && margin + blockH <= bottomLimit) {
+      doc.addPage();
+      y = margin;
+    }
     // Color-code legend (ASCII only — helvetica WinAnsi mangles ≤ and –)
     y += 6;
     ensure(20);
@@ -258,14 +286,14 @@ export function generateClientPdf(
     doc.setFont("helvetica", "normal");
     doc.setTextColor(...slate);
     const legendY = y;
-    function legendDot(x: number, label: string, fill: [number, number, number]) {
+    const legendDot = (x: number, label: string, fill: [number, number, number]) => {
       doc.setFillColor(...fill);
       doc.circle(x + 3, legendY - 2.5, 2.5, "F");
       doc.text(label, x + 9, legendY);
-    }
-    legendDot(margin, "Under 15% - Good", BUCKET_TEXT.green);
-    legendDot(margin + 130, "15-30% - Watch", BUCKET_TEXT.yellow);
-    legendDot(margin + 250, "Over 30% - Over target", BUCKET_TEXT.red);
+    };
+    legendDot(margin, "Under 15% Good", BUCKET_TEXT.green);
+    legendDot(margin + 110, "15-30% Watch", BUCKET_TEXT.yellow);
+    legendDot(margin + 210, "Over 30% Over target", BUCKET_TEXT.red);
     y += 16;
 
     ensure(36);
@@ -311,58 +339,47 @@ export function generateClientPdf(
     let totBal = 0;
     let totT30 = 0;
     let totT15 = 0;
+    const GRAY: [number, number, number] = [148, 163, 184];
     for (const card of client.creditCards) {
       ensure(16);
+      const active = isActiveCard(card);
       const util = cardUtilization(card);
       const bucket = utilBucket(util);
       const t30 = targetBalanceAt(card.creditLimit, 30);
       const t15 = targetBalanceAt(card.creditLimit, 15);
 
-      // tinted row background + colored left bar
-      doc.setFillColor(...BUCKET_TINT[bucket]);
+      // tinted row background + 3pt colored left bar (gray for closed cards)
+      doc.setFillColor(...(active ? BUCKET_TINT[bucket] : ([248, 250, 252] as [number, number, number])));
       doc.rect(margin, y - 10, W - margin * 2, 16, "F");
-      doc.setFillColor(...BUCKET_TEXT[bucket]);
+      doc.setFillColor(...(active ? BUCKET_TEXT[bucket] : GRAY));
       doc.rect(margin, y - 10, 3, 16, "F");
 
-      doc.setTextColor(40, 50, 70);
-      // Hard-truncate to fit columns — issuer must not overflow into the
-      // right-aligned LIMIT column. Available width for issuer ~ 110pt with
-      // an 8pt safety gap before the LIMIT figure starts.
-      function truncateToWidth(text: string, maxW: number): string {
-        let s = text;
-        if (doc.getTextWidth(s) <= maxW) return s;
-        while (s.length > 1 && doc.getTextWidth(s + "\u2026") > maxW) {
-          s = s.slice(0, -1);
-        }
-        return s + "\u2026";
-      }
-      const cardNameText = truncateToWidth(card.cardName || "—", 88);
-      const issuerText = truncateToWidth(card.issuer || "—", 110);
-      doc.text(cardNameText, colCard + 5, y);
-      doc.text(issuerText, colIssuer, y);
+      doc.setTextColor(...(active ? ([40, 50, 70] as [number, number, number]) : GRAY));
+      const name = (card.cardName || "\u2014") + (active ? "" : ` (${card.accountStatus})`);
+      doc.text(truncateToWidth(name, 88), colCard + 5, y);
+      doc.text(truncateToWidth(card.issuer || "\u2014", 110), colIssuer, y);
       doc.text(fmtCurrency(card.creditLimit), colLimit, y, { align: "right" });
       doc.text(fmtCurrency(card.currentBalance), colBalance, y, { align: "right" });
 
       // util in bucket color, bold
-      doc.setTextColor(...BUCKET_TEXT[bucket]);
+      doc.setTextColor(...(active ? BUCKET_TEXT[bucket] : GRAY));
       doc.setFont("helvetica", "bold");
       doc.text(`${util.toFixed(0)}%`, colUtil, y, { align: "right" });
-      doc.setFont("helvetica", "normal");
-      doc.setTextColor(40, 50, 70);
 
       // 30% target in light amber, 15% target in light green
-      doc.setFont("helvetica", "bold");
-      doc.setTextColor(...LIGHT_AMBER);
+      doc.setTextColor(...(active ? LIGHT_AMBER : GRAY));
       doc.text(fmtCurrency(t30), colT30, y, { align: "right" });
-      doc.setTextColor(...LIGHT_GREEN);
+      doc.setTextColor(...(active ? LIGHT_GREEN : GRAY));
       doc.text(fmtCurrency(t15), colT15, y, { align: "right" });
       doc.setFont("helvetica", "normal");
       doc.setTextColor(40, 50, 70);
 
-      totLimit += card.creditLimit || 0;
-      totBal += card.currentBalance || 0;
-      totT30 += t30;
-      totT15 += t15;
+      if (active) {
+        totLimit += card.creditLimit || 0;
+        totBal += card.currentBalance || 0;
+        totT30 += t30;
+        totT15 += t15;
+      }
       y += 16;
     }
 
@@ -385,10 +402,9 @@ export function generateClientPdf(
     doc.setFont("helvetica", "normal");
     y += 18;
 
-    // ===== Paydown summary box (30% / 15% targets) =====
-    const totBalance = totalBalance(client.creditCards);
-    const totLimitForBox = totalCreditLimit(client.creditCards);
-    if (totLimitForBox > 0) {
+    // ===== Paydown summary box (30% / 15% targets, open cards only) =====
+    const pd = paydownSummary(client.creditCards);
+    if (pd.limit > 0) {
       y += 10;
       ensure(70);
       const boxH = 60;
@@ -396,40 +412,41 @@ export function generateClientPdf(
       doc.setDrawColor(220, 224, 232);
       doc.roundedRect(margin, y, W - margin * 2, boxH, 6, 6, "FD");
 
-      const target30 = totLimitForBox * 0.30;
-      const target15 = totLimitForBox * 0.15;
-      const paydown30 = Math.max(0, totBalance - target30);
-      const paydown15 = Math.max(0, totBalance - target15);
-
       doc.setFont("helvetica", "bold");
       doc.setFontSize(10);
       doc.setTextColor(...navy);
       doc.text("PAYDOWN TO HIT TARGET UTILIZATION", margin + 12, y + 16);
 
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(60, 70, 90);
-      doc.text("To reach 30% utilization: pay down", margin + 12, y + 34);
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(...LIGHT_AMBER);
-      doc.text(fmtCurrency(paydown30), margin + 210, y + 34);
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(60, 70, 90);
-      doc.text(`(balance drops to ${fmtCurrency(target30)})`, margin + 290, y + 34);
+      const paydownRow = (rowY: number, pct: number, amount: number, after: number, color: [number, number, number]) => {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        doc.setTextColor(60, 70, 90);
+        const lead = `To reach ${pct}% utilization:`;
+        doc.text(lead, margin + 12, rowY);
+        let x = margin + 12 + doc.getTextWidth(lead) + 4;
+        if (amount <= 0) {
+          doc.setFont("helvetica", "bold");
+          doc.setTextColor(...color);
+          doc.text("already there", x, rowY);
+          return;
+        }
+        doc.text("pay down", x, rowY);
+        x += doc.getTextWidth("pay down") + 4;
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(11);
+        doc.setTextColor(...color);
+        const amt = fmtCurrency(amount);
+        doc.text(amt, x, rowY);
+        x += doc.getTextWidth(amt) + 6;
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        doc.setTextColor(60, 70, 90);
+        doc.text(`(balance drops to ${fmtCurrency(after)})`, x, rowY);
+      };
+      paydownRow(y + 34, 30, pd.paydown30, pd.target30, LIGHT_AMBER);
+      paydownRow(y + 50, 15, pd.paydown15, pd.target15, LIGHT_GREEN);
 
-      doc.text("To reach 15% utilization: pay down", margin + 12, y + 50);
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(...LIGHT_GREEN);
-      doc.text(fmtCurrency(paydown15), margin + 210, y + 50);
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(60, 70, 90);
-      doc.text(`(balance drops to ${fmtCurrency(target15)})`, margin + 290, y + 50);
-
-      y += boxH + 4;
+      y += boxH + 14;
       doc.setTextColor(40, 50, 70);
     }
   }
@@ -450,7 +467,7 @@ export function generateClientPdf(
   if (steps.length || client.recommendedNextSteps) {
     sectionHeader("Recommended Next Steps");
     for (const s of steps) {
-      ensure(14);
+      ensure(28);
       // Use a plain ASCII bullet — jsPDF default helvetica (WinAnsi) mangles the
       // U+2192 arrow into garbled glyphs like "I'".
       const lines = doc.splitTextToSize(`•  ${s}`, W - margin * 2);
@@ -464,18 +481,24 @@ export function generateClientPdf(
       doc.text("Custom notes:", margin, y);
       y += 14;
       doc.setFont("helvetica", "normal");
-      const lines = doc.splitTextToSize(client.recommendedNextSteps, W - margin * 2);
-      doc.text(lines, margin, y);
-      y += lines.length * 12;
+      const lines: string[] = doc.splitTextToSize(client.recommendedNextSteps, W - margin * 2);
+      for (const line of lines) {
+        ensure(12);
+        doc.text(line, margin, y);
+        y += 12;
+      }
     }
     y += 4;
   }
 
   if (client.internalNotes) {
     sectionHeader("Internal Notes");
-    const lines = doc.splitTextToSize(client.internalNotes, W - margin * 2);
-    doc.text(lines, margin, y);
-    y += lines.length * 12;
+    const lines: string[] = doc.splitTextToSize(client.internalNotes, W - margin * 2);
+    for (const line of lines) {
+      ensure(12);
+      doc.text(line, margin, y);
+      y += 12;
+    }
   }
 
   // ====== PAGE 2: CREDIT ANALYSIS REPORT ======
@@ -498,12 +521,12 @@ export function generateClientPdf(
     doc.text(
       `Get You Right Consulting · Client Profile · Page ${i} of ${pageCount}`,
       W / 2,
-      H - 24,
+      H - 22,
       { align: "center" }
     );
   }
 
-  const safe = client.name.replace(/[^a-z0-9]+/gi, "_");
+  const safe = (client.name || "Client").replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "");
   doc.save(`CPI_${safe}.pdf`);
 }
 
@@ -528,12 +551,12 @@ function renderCreditAnalysisPage(
   doc.addPage();
   let y = margin;
 
-  function ensure(space: number) {
-    if (y + space > H - margin) {
+  const ensure = (space: number) => {
+    if (y + space > H - 44) {
       doc.addPage();
       y = margin;
     }
-  }
+  };
 
   // ---- Title bar ----
   doc.setFillColor(...navy);
@@ -548,7 +571,7 @@ function renderCreditAnalysisPage(
   y = 80;
 
   // ---- KPI summary cards (2 rows) ----
-  function kpiCard(
+  const kpiCard = (
     x: number,
     cy: number,
     cw: number,
@@ -556,7 +579,7 @@ function renderCreditAnalysisPage(
     value: string,
     sub: string,
     isNegative: boolean,
-  ) {
+  ) => {
     doc.setFillColor(...muted);
     doc.rect(x, cy, cw, 56, "F");
     if (isNegative) {
@@ -576,7 +599,7 @@ function renderCreditAnalysisPage(
       doc.setTextColor(...slate);
       doc.text(sub, x + 10, cy + 50);
     }
-  }
+  };
 
   const cardW = (W - margin * 2 - 12 * 3) / 4;
   const ageStr =
@@ -655,7 +678,7 @@ function renderCreditAnalysisPage(
   const col2X = margin + (W - margin * 2) / 3;
   const col3X = margin + ((W - margin * 2) * 2) / 3;
 
-  function ageLabel(lx: number, label: string, value: string) {
+  const ageLabel = (lx: number, label: string, value: string) => {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(7);
     doc.setTextColor(...slate);
@@ -663,8 +686,14 @@ function renderCreditAnalysisPage(
     doc.setFont("helvetica", "bold");
     doc.setFontSize(10);
     doc.setTextColor(...navy);
-    doc.text(value, lx, y + 48);
-  }
+    doc.text(truncateToWidth(value, (W - margin * 2) / 3 - 16), lx, y + 48);
+  };
+  const truncateToWidth = (text: string, maxW: number): string => {
+    let t = text;
+    if (doc.getTextWidth(t) <= maxW) return t;
+    while (t.length > 1 && doc.getTextWidth(t + "\u2026") > maxW) t = t.slice(0, -1);
+    return t + "\u2026";
+  };
   ageLabel(
     col1X,
     "Oldest Account",
@@ -679,19 +708,19 @@ function renderCreditAnalysisPage(
   y += 72;
 
   // ---- Helper: render a data table ----
-  function fmtMoney(v: number | null | undefined): string {
-    if (v == null || Number.isNaN(v)) return "—";
-    return `$${Number(v).toLocaleString()}`;
-  }
+  const fmtMoney = (v: number | null | undefined): string => {
+    if (v == null || Number.isNaN(v)) return "\u2014";
+    return `$${Number(v).toLocaleString("en-US")}`;
+  };
 
-  function renderTable<T extends Record<string, unknown>>(
+  const renderTable = <T,>(
     title: string,
     count: number,
     columns: Array<{ header: string; render: (row: T) => string; width: number }>,
     rows: T[],
-  ) {
-    if (rows.length === 0) return;
-    ensure(60);
+  ) => {
+    ensure(rows.length === 0 ? 36 : 60);
+    y += 4; // breathing room above each section title
     // Heading bar
     doc.setFont("helvetica", "bold");
     doc.setFontSize(11);
@@ -699,12 +728,21 @@ function renderCreditAnalysisPage(
     doc.text(title, margin, y);
     // Count badge
     const titleW = doc.getTextWidth(title);
-    doc.setFillColor(...red);
+    doc.setFillColor(...(count > 0 ? red : slate));
     doc.roundedRect(margin + titleW + 8, y - 10, 18, 14, 7, 7, "F");
     doc.setTextColor(255, 255, 255);
     doc.setFontSize(8);
     doc.text(String(count), margin + titleW + 8 + 9, y, { align: "center" });
     y += 12;
+
+    if (rows.length === 0) {
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(9);
+      doc.setTextColor(...slate);
+      doc.text("None reported.", margin + 8, y + 6);
+      y += 22;
+      return;
+    }
 
     // Column header row
     doc.setFillColor(...muted);
@@ -727,19 +765,18 @@ function renderCreditAnalysisPage(
       ensure(16);
       let cx = margin + 8;
       for (const col of columns) {
-        const text = col.render(row) || "—";
-        const lines = doc.splitTextToSize(text, col.width - 6);
-        doc.text(lines[0] || "", cx, y + 11);
+        const text = col.render(row) || "\u2014";
+        doc.text(truncateToWidth(text, col.width - 6), cx, y + 11);
         cx += col.width;
       }
       // Subtle row separator
       doc.setDrawColor(230, 232, 240);
       doc.setLineWidth(0.3);
-      doc.line(margin, y + 16, W - margin, y + 16);
-      y += 16;
+      doc.line(margin, y + 15, W - margin, y + 15);
+      y += 15;
     }
     y += 10;
-  }
+  };
 
   // ---- Repossessions ----
   const totalW = W - margin * 2 - 16;
@@ -785,15 +822,11 @@ function renderCreditAnalysisPage(
     credit.collections,
   );
 
-  // ---- Late Payments — bucket by recency ----
-  const within12: LatePayment[] = [];
-  const between12And24: LatePayment[] = [];
-  const olderCombined: LatePayment[] = [];
-  for (const lp of credit.latePayments) {
-    if (lp.withinTwelveMonths) within12.push(lp);
-    else if ((lp.monthsSinceLate ?? 99) <= 24) between12And24.push(lp);
-    else olderCombined.push(lp);
-  }
+  // ---- Late Payments — bucket by recency (same rule as the app) ----
+  const lateBuckets = splitLatePayments(credit.latePayments);
+  const within12 = lateBuckets.within12;
+  const between12And24 = lateBuckets["12to24"];
+  const olderCombined = lateBuckets.over24;
 
   const lateCols = [
     { header: "CREDITOR", render: (r: LatePayment) => r.creditor, width: totalW * 0.22 },

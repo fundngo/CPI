@@ -11,6 +11,8 @@ import { ArrowLeft, Save, Plus, Trash2, X } from "lucide-react";
 import { SectionCard } from "@/components/SectionCard";
 import { User, Building2, CreditCard as CreditCardIcon } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { parseMissingDocs } from "@/lib/calculations";
+import { formatBureauScores } from "@shared/credit";
 import { useToast } from "@/hooks/use-toast";
 import {
   CARD_STATUSES,
@@ -38,14 +40,40 @@ export default function EditClient() {
   const [form, setForm] = useState<EditableClient>({});
   const [cards, setCards] = useState<EditableCard[]>([]);
   const [removedCardIds, setRemovedCardIds] = useState<number[]>([]);
+  const [missingDocs, setMissingDocs] = useState<string[]>([]);
+  const [newDoc, setNewDoc] = useState("");
 
   useEffect(() => {
     if (client) {
       setForm({ ...client });
       setCards(client.creditCards.map((c) => ({ ...c })));
       setRemovedCardIds([]);
+      setMissingDocs(parseMissingDocs(client.missingDocuments));
     }
   }, [client]);
+
+  const scoreErrors = (["equifaxScore", "experianScore", "transunionScore"] as const).filter((k) => {
+    const v = form[k];
+    return v != null && (!Number.isInteger(v) || v < 300 || v > 850);
+  });
+  const overrideErrors = (
+    ["fundingReadinessScoreOverride", "personalBankingStrengthOverride", "businessBankingStrengthOverride"] as const
+  ).filter((k) => {
+    const v = form[k];
+    return v != null && (!Number.isInteger(v) || v < 0 || v > 100);
+  });
+  const builtScoreText = formatBureauScores({
+    equifax: form.equifaxScore,
+    experian: form.experianScore,
+    transunion: form.transunionScore,
+  });
+
+  function addMissingDoc() {
+    const d = newDoc.trim();
+    if (!d) return;
+    setMissingDocs((list) => (list.includes(d) ? list : [...list, d]));
+    setNewDoc("");
+  }
 
   function update<K extends keyof EditableClient>(key: K, value: EditableClient[K]) {
     setForm((f) => ({ ...f, [key]: value }));
@@ -85,6 +113,9 @@ export default function EditClient() {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      if (!String(form.name || "").trim()) throw new Error("Name is required.");
+      if (scoreErrors.length) throw new Error("Credit scores must be whole numbers from 300 to 850 (or blank).");
+      if (overrideErrors.length) throw new Error("Score overrides must be whole numbers from 0 to 100 (or blank).");
       // 1) PATCH the client record
       const clientPayload: Record<string, any> = {};
       const fields: (keyof ClientWithDetails)[] = [
@@ -120,21 +151,24 @@ export default function EditClient() {
         "businessNotes",
         "internalNotes",
         "recommendedNextSteps",
+        "fundingReadinessScoreOverride",
+        "personalBankingStrengthOverride",
+        "businessBankingStrengthOverride",
+        "creditUtilizationStatusOverride",
+        "businessRevenueStatusOverride",
       ];
       for (const k of fields) {
         if (form[k] !== undefined) clientPayload[k as string] = form[k];
       }
-      // Auto-build recentCreditReport string from bureau scores when override is blank
-      const eq = form.equifaxScore;
-      const ex = form.experianScore;
-      const tu = form.transunionScore;
-      const triParts: string[] = [];
-      if (eq != null && eq !== 0) triParts.push(`Equifax ${eq}`);
-      if (ex != null && ex !== 0) triParts.push(`Experian ${ex}`);
-      if (tu != null && tu !== 0) triParts.push(`TransUnion ${tu}`);
-      if (triParts.length > 0 && !form.recentCreditReport?.trim()) {
-        clientPayload.recentCreditReport = triParts.join(", ");
+      clientPayload.name = String(form.name).trim();
+      // The score string is always rebuilt from the 3 bureau inputs. The legacy
+      // free text is kept only when no structured score exists.
+      if (builtScoreText) clientPayload.recentCreditReport = builtScoreText;
+      // Blank override text fields mean "no override"
+      for (const k of ["creditUtilizationStatusOverride", "businessRevenueStatusOverride"]) {
+        if (typeof clientPayload[k] === "string" && !clientPayload[k].trim()) clientPayload[k] = null;
       }
+      clientPayload.missingDocuments = JSON.stringify(missingDocs);
       await apiRequest("PATCH", `/api/clients/${id}`, clientPayload);
 
       // 2) Delete removed cards
@@ -161,9 +195,9 @@ export default function EditClient() {
         }
       }
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/clients", id] });
+    onSuccess: async () => {
+      // Wait for fresh data so the profile never flashes stale values.
+      await queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
       toast({ title: "Changes saved" });
       setLocation(`/clients/${id}`);
     },
@@ -212,7 +246,7 @@ export default function EditClient() {
           </Button>
           <Button
             onClick={() => saveMutation.mutate()}
-            disabled={saveMutation.isPending}
+            disabled={saveMutation.isPending || scoreErrors.length > 0 || overrideErrors.length > 0}
             className="gap-2"
             data-testid="button-save-edit"
           >
@@ -272,6 +306,14 @@ export default function EditClient() {
                 data-testid="input-edit-email"
               />
             </FormField>
+            <FormField label="Onboarding Date">
+              <Input
+                type="date"
+                value={form.onboardingDate || ""}
+                onChange={(e) => update("onboardingDate", e.target.value)}
+                data-testid="input-edit-onboarding-date"
+              />
+            </FormField>
           </div>
         </SectionCard>
 
@@ -327,6 +369,7 @@ export default function EditClient() {
                   const v = e.target.value.trim();
                   update("equifaxScore", v === "" ? null : Number(v));
                 }}
+                className={scoreErrors.includes("equifaxScore") ? "border-destructive" : ""}
                 data-testid="input-edit-equifax"
               />
             </FormField>
@@ -341,6 +384,7 @@ export default function EditClient() {
                   const v = e.target.value.trim();
                   update("experianScore", v === "" ? null : Number(v));
                 }}
+                className={scoreErrors.includes("experianScore") ? "border-destructive" : ""}
                 data-testid="input-edit-experian"
               />
             </FormField>
@@ -355,17 +399,21 @@ export default function EditClient() {
                   const v = e.target.value.trim();
                   update("transunionScore", v === "" ? null : Number(v));
                 }}
+                className={scoreErrors.includes("transunionScore") ? "border-destructive" : ""}
                 data-testid="input-edit-transunion"
               />
             </FormField>
-            <FormField label="Recent Credit Report (optional override)" className="md:col-span-2">
-              <Input
-                value={form.recentCreditReport || ""}
-                onChange={(e) => update("recentCreditReport", e.target.value)}
-                placeholder="Auto-built from scores above when blank"
-                data-testid="input-edit-credit-report"
-              />
-            </FormField>
+            <div className="md:col-span-2 -mt-1">
+              {scoreErrors.length > 0 ? (
+                <div className="text-xs text-destructive" data-testid="text-edit-score-error">
+                  Scores must be whole numbers from 300 to 850, or blank.
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground" data-testid="text-edit-credit-report-preview">
+                  Credit Report shows as: <span className="font-medium text-card-foreground">{builtScoreText || form.recentCreditReport || "—"}</span>
+                </div>
+              )}
+            </div>
             <FormField label="Personal Notes" className="md:col-span-2">
               <Textarea
                 rows={3}
@@ -624,6 +672,112 @@ export default function EditClient() {
           </div>
         </SectionCard>
 
+        {/* Missing documents */}
+        <SectionCard title="Missing Documents" testId="section-edit-missing-docs" description="Each missing document lowers the readiness score by 5 (max 20).">
+          <div className="space-y-2 pt-2">
+            {missingDocs.length === 0 && (
+              <div className="text-sm text-muted-foreground" data-testid="text-edit-no-missing-docs">None.</div>
+            )}
+            {missingDocs.map((d, i) => (
+              <div key={`${d}-${i}`} className="flex items-center justify-between gap-3 border border-border rounded-md px-3 py-2 text-sm text-card-foreground" data-testid={`edit-missing-doc-${i}`}>
+                <span>{d}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-destructive"
+                  onClick={() => setMissingDocs((list) => list.filter((_, idx) => idx !== i))}
+                  data-testid={`button-remove-missing-doc-${i}`}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+            <div className="flex gap-2 pt-1">
+              <Input
+                value={newDoc}
+                onChange={(e) => setNewDoc(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    addMissingDoc();
+                  }
+                }}
+                placeholder="e.g. Last 3 months of bank statements"
+                data-testid="input-new-missing-doc"
+              />
+              <Button type="button" variant="outline" onClick={addMissingDoc} className="gap-1.5 shrink-0" data-testid="button-add-missing-doc">
+                <Plus className="h-4 w-4" /> Add
+              </Button>
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* Overrides */}
+        <SectionCard
+          title="Summary Overrides"
+          testId="section-edit-overrides"
+          description="Leave blank to use the calculated value. A value here replaces the calculation everywhere, including the PDF."
+        >
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+            {(
+              [
+                ["fundingReadinessScoreOverride", "Funding Readiness (0–100)"],
+                ["personalBankingStrengthOverride", "Personal Banking (0–100)"],
+                ["businessBankingStrengthOverride", "Business Banking (0–100)"],
+              ] as const
+            ).map(([key, label]) => (
+              <FormField key={key} label={label}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={form[key] ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value.trim();
+                    update(key, v === "" ? null : Number(v));
+                  }}
+                  placeholder="Calculated"
+                  className={overrideErrors.includes(key) ? "border-destructive" : ""}
+                  data-testid={`input-edit-${key}`}
+                />
+              </FormField>
+            ))}
+            <FormField label="Utilization Status">
+              <Select
+                value={form.creditUtilizationStatusOverride || "__auto"}
+                onValueChange={(v) => update("creditUtilizationStatusOverride", v === "__auto" ? null : v)}
+              >
+                <SelectTrigger data-testid="select-edit-util-status-override">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__auto">Calculated</SelectItem>
+                  {["Excellent", "Good", "Caution", "Critical"].map((v) => (
+                    <SelectItem key={v} value={v}>{v}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label="Revenue Status">
+              <Select
+                value={form.businessRevenueStatusOverride || "__auto"}
+                onValueChange={(v) => update("businessRevenueStatusOverride", v === "__auto" ? null : v)}
+              >
+                <SelectTrigger data-testid="select-edit-revenue-status-override">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__auto">Calculated</SelectItem>
+                  {["None", "Starting", "Growing", "Strong"].map((v) => (
+                    <SelectItem key={v} value={v}>{v}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FormField>
+          </div>
+        </SectionCard>
+
         {/* Notes */}
         <SectionCard title="Internal & Recommendations" testId="section-edit-notes">
           <div className="grid grid-cols-1 gap-4 pt-2">
@@ -658,7 +812,7 @@ export default function EditClient() {
           </Button>
           <Button
             onClick={() => saveMutation.mutate()}
-            disabled={saveMutation.isPending}
+            disabled={saveMutation.isPending || scoreErrors.length > 0 || overrideErrors.length > 0}
             className="gap-2"
             data-testid="button-save-edit-bottom"
           >

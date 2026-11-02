@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation, useRoute } from "wouter";
-import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { CreditAnalysisView } from "@/components/CreditAnalysisView";
 import { Button } from "@/components/ui/button";
@@ -47,14 +46,20 @@ import {
   autoFlags,
   autoRecommendedSteps,
   businessBankingStrength,
-  businessRevenueStatus,
+  businessRevenueStatusFor,
   fmtDate,
   fundingReadinessScore,
   overallUtilization,
   parseMissingDocs,
   personalBankingStrength,
-  utilizationStatus,
+  strengthColor,
+  strengthLabel,
+  utilizationColor,
+  utilizationStatusFor,
 } from "@/lib/calculations";
+import { formatBureauScores } from "@shared/credit";
+import { ReadinessGauge } from "@/components/ReadinessGauge";
+import { UtilizationDonut } from "@/components/UtilizationDonut";
 import type { ClientStatus, ClientWithDetails } from "@shared/schema";
 import { generateClientPdf } from "@/lib/pdfExport";
 
@@ -100,8 +105,8 @@ export default function ClientProfile() {
   const score = fundingReadinessScore(client);
   const flags = autoFlags(client);
   const autoSteps = autoRecommendedSteps(client);
-  const revStatus = businessRevenueStatus(client.monthlyRevenue);
-  const utilStat = utilizationStatus(util);
+  const revStatus = businessRevenueStatusFor(client);
+  const utilStat = utilizationStatusFor(client);
 
   return (
     <div className="px-6 sm:px-10 py-10 max-w-5xl mx-auto pb-28">
@@ -273,33 +278,115 @@ export default function ClientProfile() {
         </div>
       ) : (
       <div data-testid="tab-content-cpi">
-      {/* Auto Flags */}
-      {flags.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-8" data-testid="flags-row">
-          {flags.map((flag, i) => {
-            const styles =
-              flag.kind === "red"
-                ? "bg-[hsl(0_80%_96%)] text-[hsl(0_72%_45%)] border-[hsl(0_70%_88%)]"
-                : flag.kind === "amber"
-                ? "bg-[hsl(38_92%_95%)] text-[hsl(30_80%_35%)] border-[hsl(38_85%_85%)]"
-                : "bg-[hsl(158_65%_95%)] text-[hsl(158_65%_28%)] border-[hsl(158_50%_85%)]";
-            const Icon =
-              flag.kind === "green" ? CheckCircle2 : flag.kind === "red" ? AlertTriangle : TriangleAlert;
-            return (
-              <div
-                key={i}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium ${styles}`}
-                data-testid={`flag-${flag.kind}-${i}`}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                {flag.text}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
       <div className="space-y-6">
+        {/* Overall Client Summary */}
+        <SectionCard
+          title="Overall Client Summary"
+          icon={<ClipboardCheck className="h-5 w-5" />}
+          testId="section-summary"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
+            <div className="flex justify-center">
+              <ReadinessGauge score={score} size={170} />
+            </div>
+            <div className="space-y-5">
+              <StrengthMeter label="Personal Banking" score={pbs} testId="meter-personal" />
+              <StrengthMeter label="Business Banking" score={bbs} testId="meter-business" />
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Business Revenue</span>
+                <span className="font-semibold text-card-foreground" data-testid="text-revenue-status">{revStatus}</span>
+              </div>
+            </div>
+            <div className="flex flex-col items-center">
+              <UtilizationDonut pct={util} size={150} />
+              <div className="mt-2 text-sm font-medium" style={{ color: utilizationColor(util) }} data-testid="text-util-status">
+                {utilStat}
+              </div>
+            </div>
+          </div>
+
+          {flags.length > 0 && (
+            <div className="flex flex-wrap gap-2 mt-6" data-testid="flags-row">
+              {flags.map((flag, i) => {
+                const styles =
+                  flag.kind === "red"
+                    ? "bg-[hsl(0_80%_96%)] text-[hsl(0_72%_45%)] border-[hsl(0_70%_88%)]"
+                    : flag.kind === "amber"
+                    ? "bg-[hsl(38_92%_95%)] text-[hsl(30_80%_35%)] border-[hsl(38_85%_85%)]"
+                    : "bg-[hsl(120_60%_95%)] text-[hsl(120_60%_28%)] border-[hsl(120_50%_85%)]";
+                const Icon =
+                  flag.kind === "green" ? CheckCircle2 : flag.kind === "red" ? AlertTriangle : TriangleAlert;
+                return (
+                  <div
+                    key={i}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium ${styles}`}
+                    data-testid={`flag-${flag.kind}-${i}`}
+                  >
+                    <Icon className="h-3.5 w-3.5" />
+                    {flag.text}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 pt-6 border-t border-border">
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold mb-2">
+                Recommended Next Steps
+              </div>
+              {autoSteps.length === 0 && !client.recommendedNextSteps ? (
+                <div className="text-sm text-muted-foreground">No suggestions — client looks solid.</div>
+              ) : (
+                <div className="space-y-1.5">
+                  {autoSteps.map((step, i) => (
+                    <div
+                      key={i}
+                      className="flex items-start gap-2 px-3 py-2 bg-primary/5 border border-primary/25 rounded-md text-sm text-card-foreground"
+                      data-testid={`auto-step-${i}`}
+                    >
+                      <span className="text-[hsl(120_60%_38%)] font-bold">›</span>
+                      <span>{step}</span>
+                    </div>
+                  ))}
+                  {client.recommendedNextSteps && (
+                    <div className="px-3 py-2 text-sm text-card-foreground whitespace-pre-wrap border border-border rounded-md" data-testid="text-custom-steps">
+                      {client.recommendedNextSteps}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold mb-2">
+                Missing Documents
+              </div>
+              {missingDocs.length === 0 ? (
+                <div className="text-sm text-muted-foreground">None — all required documents on file.</div>
+              ) : (
+                <ul className="space-y-1.5">
+                  {missingDocs.map((doc, i) => (
+                    <li key={i} className="flex items-start gap-2 text-sm text-card-foreground" data-testid={`missing-doc-${i}`}>
+                      <span className="text-muted-foreground">•</span>
+                      <span>{doc}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {client.internalNotes && (
+                <div className="mt-4">
+                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-semibold mb-1">
+                    Internal Notes
+                  </div>
+                  <div className="text-sm text-card-foreground whitespace-pre-wrap" data-testid="text-internal-notes">
+                    {client.internalNotes}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </SectionCard>
+
         {/* Personal Info */}
         <SectionCard
           title="Personal Information"
@@ -311,15 +398,15 @@ export default function ClientProfile() {
             <ReadOnlyField label="Bank Accounts" value={client.bankAccountsList} />
             <ReadOnlyField label="Age of Bank Accounts" value={client.bankAccountsAge} />
             <ReadOnlyField
-              label="Recent Credit Report"
-              value={(() => {
-                const parts: string[] = [];
-                if (client.equifaxScore != null) parts.push(`Equifax ${client.equifaxScore}`);
-                if (client.experianScore != null) parts.push(`Experian ${client.experianScore}`);
-                if (client.transunionScore != null) parts.push(`TransUnion ${client.transunionScore}`);
-                if (parts.length > 0) return parts.join(", ");
-                return client.recentCreditReport;
-              })()}
+              label="Credit Report"
+              testId="text-credit-report"
+              value={
+                formatBureauScores({
+                  equifax: client.equifaxScore,
+                  experian: client.experianScore,
+                  transunion: client.transunionScore,
+                }) || client.recentCreditReport
+              }
             />
             <ReadOnlyBool label="Has Savings Account" value={client.hasSavings} />
             <ReadOnlyBool label="Has Retirement / 401(k)" value={client.hasRetirement401k} />
@@ -380,80 +467,8 @@ export default function ClientProfile() {
           </div>
         </SectionCard>
 
-        {/* Summary */}
-        <SectionCard
-          title="Overall Client Summary"
-          icon={<ClipboardCheck className="h-5 w-5" />}
-          testId="section-summary"
-        >
-          <div className="space-y-5 pt-4">
-            <SummaryReadRow label="Personal Banking Strength" value={`${pbs}`} />
-            <SummaryReadRow label="Business Banking Strength" value={`${bbs}`} />
-            <SummaryReadRow label="Credit Utilization Status" value={utilStat} />
-            <SummaryReadRow label="Business Revenue Status" value={revStatus} />
-            <SummaryReadRow label="Funding Readiness Score" value={`${score}`} />
-
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-                Missing Documents
-              </div>
-              {missingDocs.length === 0 ? (
-                <div className="text-sm text-muted-foreground">None — all required documents on file.</div>
-              ) : (
-                <ul className="space-y-1.5">
-                  {missingDocs.map((doc, i) => (
-                    <li
-                      key={i}
-                      className="flex items-start gap-2 text-sm text-card-foreground"
-                      data-testid={`missing-doc-${i}`}
-                    >
-                      <span className="text-muted-foreground mt-1">•</span>
-                      <span>{doc}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-                Recommended Next Steps
-              </div>
-              {autoSteps.length === 0 ? (
-                <div className="text-sm text-muted-foreground">
-                  No suggestions — client looks solid.
-                </div>
-              ) : (
-                <div className="space-y-1.5">
-                  {autoSteps.map((step, i) => (
-                    <div
-                      key={i}
-                      className="flex items-start gap-2 px-3 py-2 bg-accent/5 border border-accent/20 rounded-md text-sm text-card-foreground"
-                      data-testid={`auto-step-${i}`}
-                    >
-                      <span className="text-accent mt-0.5">→</span>
-                      <span>{step}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {client.recommendedNextSteps && (
-              <ReadOnlyField
-                label="Recommended Next Steps (notes)"
-                value={client.recommendedNextSteps}
-                multiline
-              />
-            )}
-            {client.internalNotes && (
-              <ReadOnlyField label="Internal Notes" value={client.internalNotes} multiline />
-            )}
-          </div>
-        </SectionCard>
-
         <div className="text-center text-xs text-white/50 pt-4">
-          Use Edit to update client info, or delete and re-upload a fresh credit report.
+          Use Edit to update client info, or upload a new credit report under Files and click Refresh from files.
         </div>
       </div>
       </div>
@@ -466,10 +481,12 @@ function ReadOnlyField({
   label,
   value,
   multiline,
+  testId,
 }: {
   label: string;
   value: any;
   multiline?: boolean;
+  testId?: string;
 }) {
   const empty = value === null || value === undefined || value === "" || value === 0;
   const display = empty ? "—" : String(value);
@@ -482,6 +499,7 @@ function ReadOnlyField({
         className={`${
           multiline ? "whitespace-pre-wrap" : ""
         } text-base ${empty ? "text-muted-foreground" : "text-card-foreground"}`}
+        data-testid={testId}
       >
         {display}
       </div>
@@ -507,25 +525,20 @@ function ReadOnlyBool({ label, value }: { label: string; value: boolean }) {
   );
 }
 
-function SummaryReadRow({ label, value }: { label: string; value: string }) {
+function StrengthMeter({ label, score, testId }: { label: string; score: number; testId: string }) {
+  const color = strengthColor(score);
   return (
-    <div className="flex items-center justify-between border-b border-border pb-3">
-      <div className="text-sm font-medium text-card-foreground">{label}</div>
-      <div className="text-sm tabular-nums text-card-foreground">{value}</div>
-    </div>
-  );
-}
-
-function QuickStatCard({ label, value }: { label: string; value: string }) {
-  return (
-    <Card className="border-card-border shadow-xl ring-1 ring-white/5 rounded-xl overflow-hidden">
-      <div className="bg-card p-5 rounded-xl">
-        <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-          {label}
-        </div>
-        <div className="text-2xl font-bold tabular-nums mt-1 text-card-foreground">{value}</div>
+    <div data-testid={testId}>
+      <div className="flex items-center justify-between text-sm mb-1.5">
+        <span className="text-muted-foreground">{label}</span>
+        <span className="font-semibold tabular-nums" style={{ color }} data-testid={`${testId}-value`}>
+          {score} · {strengthLabel(score)}
+        </span>
       </div>
-    </Card>
+      <div className="h-2.5 rounded-full bg-muted overflow-hidden">
+        <div className="h-full rounded-full transition-all" style={{ width: `${score}%`, backgroundColor: color }} />
+      </div>
+    </div>
   );
 }
 
